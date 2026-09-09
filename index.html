@@ -18,42 +18,52 @@
 <div id="root"></div>
 
 <!--
-  window.storage API는 그대로 유지하되, 내부 구현만 Firestore로 교체했어.
-  - shared=false(개인, 예: profile 로그인 세션)는 기기별 localStorage에 그대로 저장 (동기화 필요 없는 데이터).
-  - shared=true(계정/할일/시간표/성적/게시판 등)는 Firestore "examPlannerShared" 컬렉션에 저장되어
-    모든 학생의 모든 기기에서 실시간으로 같은 데이터를 보게 됨.
+  window.storage API는 그대로 유지하되, 내부 구현은 Firestore "REST API"를 일반 fetch()로 직접 호출하는 방식이야.
+  (Firebase SDK의 실시간 스트리밍 채널이 학교 네트워크 방화벽에 막혀서 응답 없이 멈추는 문제가 있어,
+  평범한 HTTPS 요청만 쓰는 REST 방식으로 바꿔서 방화벽 호환성을 높였어.)
+  - shared=false(개인, 예: profile 로그인 세션)는 기기별 localStorage 그대로.
+  - shared=true(계정/할일/시간표/성적/게시판 등)는 Firestore "examPlannerShared" 컬렉션에 저장.
 -->
-<script type="module">
-  import { initializeApp } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-app.js";
-  import {
-    initializeFirestore, collection, doc, getDoc, setDoc, deleteDoc,
-    query, where, getDocs, orderBy, documentId,
-  } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-firestore.js";
-
-  const firebaseConfig = {
-    apiKey: "AIzaSyDPV3RlDIG5IKdgS6BIA54Aqe5is1HyOKQ",
-    authDomain: "planner-help.firebaseapp.com",
-    projectId: "planner-help",
-    storageBucket: "planner-help.firebasestorage.app",
-    messagingSenderId: "958928376942",
-    appId: "1:958928376942:web:6f050f941e0aecaf0c827f",
-    measurementId: "G-3156M4LDYX",
-  };
-
-  const app = initializeApp(firebaseConfig);
-  // 학교 와이파이 등 방화벽/프록시 환경에서는 Firestore의 기본 실시간 스트리밍(WebChannel) 연결이
-  // 응답도 에러도 없이 멈춰버릴 수 있어서, 훨씬 호환성이 좋은 long-polling 방식을 자동 감지하도록 설정.
-  const db = initializeFirestore(app, { experimentalAutoDetectLongPolling: true });
+<script>
+(function () {
+  const PROJECT_ID = "planner-help";
+  const API_KEY = "AIzaSyDPV3RlDIG5IKdgS6BIA54Aqe5is1HyOKQ";
+  const BASE_URL = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
   const SHARED_COLLECTION = "examPlannerShared";
   const LOCAL_PREFIX = "examPlannerStorage:personal:";
 
-  // Firestore 요청이 응답 없이 멈추는 경우를 대비한 안전장치: 8초 안에 응답이 없으면
-  // 에러를 던져서 화면이 "확인 중..."처럼 영원히 멈춰있지 않고, 기본값으로라도 진행되게 함.
-  function withTimeout(promise, ms = 8000) {
-    return Promise.race([
-      promise,
-      new Promise((_, reject) => setTimeout(() => reject(new Error("storage-timeout")), ms)),
-    ]);
+  // fetch에 타임아웃을 걸되, AbortController로 요청 자체를 취소해서 좀비 요청이 안 남게 함.
+  async function fetchWithTimeout(url, options = {}, ms = 8000) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), ms);
+    try {
+      return await fetch(url, { ...options, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function encodeFields(obj) {
+    const fields = {};
+    for (const k in obj) {
+      const v = obj[k];
+      if (typeof v === "number") fields[k] = { integerValue: String(Math.trunc(v)) };
+      else fields[k] = { stringValue: String(v) };
+    }
+    return fields;
+  }
+
+  function decodeFields(fields) {
+    const out = {};
+    for (const k in fields || {}) {
+      const f = fields[k];
+      if (f.stringValue !== undefined) out[k] = f.stringValue;
+      else if (f.integerValue !== undefined) out[k] = Number(f.integerValue);
+      else if (f.doubleValue !== undefined) out[k] = f.doubleValue;
+      else if (f.booleanValue !== undefined) out[k] = f.booleanValue;
+      else out[k] = null;
+    }
+    return out;
   }
 
   window.storage = {
@@ -68,9 +78,14 @@
         }
       }
       try {
-        const snap = await withTimeout(getDoc(doc(db, SHARED_COLLECTION, key)));
-        if (!snap.exists()) return null;
-        return { key, value: snap.data().value, shared: true };
+        const res = await fetchWithTimeout(
+          `${BASE_URL}/${SHARED_COLLECTION}/${encodeURIComponent(key)}?key=${API_KEY}`
+        );
+        if (res.status === 404) return null;
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+        const decoded = decodeFields(data.fields);
+        return { key, value: decoded.value, shared: true };
       } catch (e) {
         console.error("storage.get 실패", key, e);
         return null;
@@ -86,7 +101,16 @@
         }
       }
       try {
-        await withTimeout(setDoc(doc(db, SHARED_COLLECTION, key), { value, updatedAt: Date.now() }));
+        const body = { fields: encodeFields({ value, updatedAt: Date.now() }) };
+        const res = await fetchWithTimeout(
+          `${BASE_URL}/${SHARED_COLLECTION}/${encodeURIComponent(key)}?key=${API_KEY}`,
+          {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          }
+        );
+        if (!res.ok) throw new Error("HTTP " + res.status);
         return { key, value, shared: true };
       } catch (e) {
         console.error("storage.set 실패", key, e);
@@ -103,7 +127,11 @@
         }
       }
       try {
-        await withTimeout(deleteDoc(doc(db, SHARED_COLLECTION, key)));
+        const res = await fetchWithTimeout(
+          `${BASE_URL}/${SHARED_COLLECTION}/${encodeURIComponent(key)}?key=${API_KEY}`,
+          { method: "DELETE" }
+        );
+        if (!res.ok && res.status !== 404) throw new Error("HTTP " + res.status);
         return { key, deleted: true, shared: true };
       } catch (e) {
         console.error("storage.delete 실패", key, e);
@@ -127,13 +155,21 @@
         }
       }
       try {
-        const col = collection(db, SHARED_COLLECTION);
-        const q = prefix
-          ? query(col, orderBy(documentId()), where(documentId(), ">=", prefix), where(documentId(), "<", prefix + "\uf8ff"))
-          : query(col);
-        const snaps = await withTimeout(getDocs(q));
         const keys = [];
-        snaps.forEach((d) => keys.push(d.id));
+        let pageToken = "";
+        do {
+          const url =
+            `${BASE_URL}/${SHARED_COLLECTION}?key=${API_KEY}&pageSize=300` +
+            (pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : "");
+          const res = await fetchWithTimeout(url);
+          if (!res.ok) throw new Error("HTTP " + res.status);
+          const data = await res.json();
+          (data.documents || []).forEach((d) => {
+            const id = d.name.split("/").pop();
+            if (!prefix || id.startsWith(prefix)) keys.push(id);
+          });
+          pageToken = data.nextPageToken || "";
+        } while (pageToken);
         return { keys, prefix, shared: true };
       } catch (e) {
         console.error("storage.list 실패", prefix, e);
@@ -141,6 +177,7 @@
       }
     },
   };
+})();
 </script>
 
 <script type="text/babel" data-presets="react">
