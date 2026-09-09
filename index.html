@@ -18,61 +18,118 @@
 <div id="root"></div>
 
 <!--
-  GitHub Pages는 정적 호스팅이라 서버 저장소가 없어. 원본 코드가 쓰던 window.storage API를
-  브라우저 localStorage로 흉내 낸 것뿐이라, "공유(shared)" 데이터도 실제로는 같은 브라우저 안에서만
-  공유돼(다른 학생 컴퓨터/폰과는 동기화되지 않음). 진짜 여러 명이 같이 쓰는 서버가 필요하면
-  Firebase/Supabase 같은 백엔드 연동이 따로 필요해.
+  window.storage API는 그대로 유지하되, 내부 구현만 Firestore로 교체했어.
+  - shared=false(개인, 예: profile 로그인 세션)는 기기별 localStorage에 그대로 저장 (동기화 필요 없는 데이터).
+  - shared=true(계정/할일/시간표/성적/게시판 등)는 Firestore "examPlannerShared" 컬렉션에 저장되어
+    모든 학생의 모든 기기에서 실시간으로 같은 데이터를 보게 됨.
 -->
-<script>
-(function () {
-  const PREFIX = "examPlannerStorage:";
-  function fullKey(key, shared) {
-    return PREFIX + (shared ? "shared:" : "personal:") + key;
-  }
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-app.js";
+  import {
+    getFirestore, collection, doc, getDoc, setDoc, deleteDoc,
+    query, where, getDocs, orderBy, documentId,
+  } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-firestore.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyDPV3RlDIG5IKdgS6BIA54Aqe5is1HyOKQ",
+    authDomain: "planner-help.firebaseapp.com",
+    projectId: "planner-help",
+    storageBucket: "planner-help.firebasestorage.app",
+    messagingSenderId: "958928376942",
+    appId: "1:958928376942:web:6f050f941e0aecaf0c827f",
+    measurementId: "G-3156M4LDYX",
+  };
+
+  const app = initializeApp(firebaseConfig);
+  const db = getFirestore(app);
+  const SHARED_COLLECTION = "examPlannerShared";
+  const LOCAL_PREFIX = "examPlannerStorage:personal:";
+
   window.storage = {
     async get(key, shared = false) {
+      if (!shared) {
+        try {
+          const raw = localStorage.getItem(LOCAL_PREFIX + key);
+          if (raw === null) return null;
+          return { key, value: raw, shared: false };
+        } catch (e) {
+          return null;
+        }
+      }
       try {
-        const raw = localStorage.getItem(fullKey(key, shared));
-        if (raw === null) return null;
-        return { key, value: raw, shared: !!shared };
+        const snap = await getDoc(doc(db, SHARED_COLLECTION, key));
+        if (!snap.exists()) return null;
+        return { key, value: snap.data().value, shared: true };
       } catch (e) {
+        console.error("storage.get 실패", key, e);
         return null;
       }
     },
     async set(key, value, shared = false) {
+      if (!shared) {
+        try {
+          localStorage.setItem(LOCAL_PREFIX + key, value);
+          return { key, value, shared: false };
+        } catch (e) {
+          return null;
+        }
+      }
       try {
-        localStorage.setItem(fullKey(key, shared), value);
-        return { key, value, shared: !!shared };
+        await setDoc(doc(db, SHARED_COLLECTION, key), { value, updatedAt: Date.now() });
+        return { key, value, shared: true };
       } catch (e) {
+        console.error("storage.set 실패", key, e);
         return null;
       }
     },
     async delete(key, shared = false) {
+      if (!shared) {
+        try {
+          localStorage.removeItem(LOCAL_PREFIX + key);
+          return { key, deleted: true, shared: false };
+        } catch (e) {
+          return null;
+        }
+      }
       try {
-        localStorage.removeItem(fullKey(key, shared));
-        return { key, deleted: true, shared: !!shared };
+        await deleteDoc(doc(db, SHARED_COLLECTION, key));
+        return { key, deleted: true, shared: true };
       } catch (e) {
+        console.error("storage.delete 실패", key, e);
         return null;
       }
     },
     async list(prefix = "", shared = false) {
-      try {
-        const base = PREFIX + (shared ? "shared:" : "personal:");
-        const keys = [];
-        for (let i = 0; i < localStorage.length; i++) {
-          const k = localStorage.key(i);
-          if (k && k.startsWith(base)) {
-            const short = k.slice(base.length);
-            if (!prefix || short.startsWith(prefix)) keys.push(short);
+      if (!shared) {
+        try {
+          const keys = [];
+          for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i);
+            if (k && k.startsWith(LOCAL_PREFIX)) {
+              const short = k.slice(LOCAL_PREFIX.length);
+              if (!prefix || short.startsWith(prefix)) keys.push(short);
+            }
           }
+          return { keys, prefix, shared: false };
+        } catch (e) {
+          return { keys: [], prefix, shared: false };
         }
-        return { keys, prefix, shared: !!shared };
+      }
+      try {
+        const col = collection(db, SHARED_COLLECTION);
+        const q = prefix
+          ? query(col, orderBy(documentId()), where(documentId(), ">=", prefix), where(documentId(), "<", prefix + "\uf8ff"))
+          : query(col);
+        const snaps = await getDocs(q);
+        const keys = [];
+        snaps.forEach((d) => keys.push(d.id));
+        return { keys, prefix, shared: true };
       } catch (e) {
-        return { keys: [], prefix, shared: !!shared };
+        console.error("storage.list 실패", prefix, e);
+        return { keys: [], prefix, shared: true };
       }
     },
   };
-})();
 </script>
 
 <script type="text/babel" data-presets="react">
