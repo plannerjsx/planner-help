@@ -26,7 +26,7 @@
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-app.js";
   import {
-    getFirestore, collection, doc, getDoc, setDoc, deleteDoc,
+    initializeFirestore, collection, doc, getDoc, setDoc, deleteDoc,
     query, where, getDocs, orderBy, documentId,
   } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-firestore.js";
 
@@ -41,9 +41,20 @@
   };
 
   const app = initializeApp(firebaseConfig);
-  const db = getFirestore(app);
+  // 학교 와이파이 등 방화벽/프록시 환경에서는 Firestore의 기본 실시간 스트리밍(WebChannel) 연결이
+  // 응답도 에러도 없이 멈춰버릴 수 있어서, 훨씬 호환성이 좋은 long-polling 방식을 자동 감지하도록 설정.
+  const db = initializeFirestore(app, { experimentalAutoDetectLongPolling: true });
   const SHARED_COLLECTION = "examPlannerShared";
   const LOCAL_PREFIX = "examPlannerStorage:personal:";
+
+  // Firestore 요청이 응답 없이 멈추는 경우를 대비한 안전장치: 8초 안에 응답이 없으면
+  // 에러를 던져서 화면이 "확인 중..."처럼 영원히 멈춰있지 않고, 기본값으로라도 진행되게 함.
+  function withTimeout(promise, ms = 8000) {
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("storage-timeout")), ms)),
+    ]);
+  }
 
   window.storage = {
     async get(key, shared = false) {
@@ -57,7 +68,7 @@
         }
       }
       try {
-        const snap = await getDoc(doc(db, SHARED_COLLECTION, key));
+        const snap = await withTimeout(getDoc(doc(db, SHARED_COLLECTION, key)));
         if (!snap.exists()) return null;
         return { key, value: snap.data().value, shared: true };
       } catch (e) {
@@ -75,7 +86,7 @@
         }
       }
       try {
-        await setDoc(doc(db, SHARED_COLLECTION, key), { value, updatedAt: Date.now() });
+        await withTimeout(setDoc(doc(db, SHARED_COLLECTION, key), { value, updatedAt: Date.now() }));
         return { key, value, shared: true };
       } catch (e) {
         console.error("storage.set 실패", key, e);
@@ -92,7 +103,7 @@
         }
       }
       try {
-        await deleteDoc(doc(db, SHARED_COLLECTION, key));
+        await withTimeout(deleteDoc(doc(db, SHARED_COLLECTION, key)));
         return { key, deleted: true, shared: true };
       } catch (e) {
         console.error("storage.delete 실패", key, e);
@@ -120,7 +131,7 @@
         const q = prefix
           ? query(col, orderBy(documentId()), where(documentId(), ">=", prefix), where(documentId(), "<", prefix + "\uf8ff"))
           : query(col);
-        const snaps = await getDocs(q);
+        const snaps = await withTimeout(getDocs(q));
         const keys = [];
         snaps.forEach((d) => keys.push(d.id));
         return { keys, prefix, shared: true };
