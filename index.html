@@ -24,6 +24,13 @@
   - shared=false(개인, 예: profile 로그인 세션)는 기기별 localStorage 그대로.
   - shared=true(계정/할일/시간표/성적/게시판 등)는 Firestore "examPlannerShared" 컬렉션에 저장.
 -->
+
+<!--
+  변경 이력
+  - 2026-09-10: 상단 탭 메뉴바(홈/위클리/데일리/...)를 항상 전체 나열하던 방식에서,
+    평소엔 "현재 페이지 이름"만 보이는 드롭다운 버튼으로 바꿈. 누르면 목록이 펼쳐지고
+    선택하면 자동으로 닫힘. (tabMenuOpen 상태 추가, 관련 코드는 "현재 페이지만 뜨게" 주석 참고)
+-->
 <script>
 (function () {
   const PROJECT_ID = "planner-help";
@@ -1037,6 +1044,7 @@ function ExamPlanner() {
 
         <DdayHero exam={exam} dday={dday} onSave={saveExam} loaded={examLoaded} canEdit={profile.studentId === VIEWER_ID} />
 
+        {/* 현재 페이지만 뜨게: 2026-09-10 변경 — 전체 탭 나열 대신 현재 탭 이름만 보이는 드롭다운으로 교체 */}
         <nav style={{ position: "relative", marginBottom: 16 }}>
           <button
             onClick={() => setTabMenuOpen((v) => !v)}
