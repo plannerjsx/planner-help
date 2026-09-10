@@ -3334,6 +3334,8 @@ function GlobalStyle() {
       * { box-sizing: border-box; font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, 'Malgun Gothic', sans-serif; }
       input[type=number]::-webkit-inner-spin-button { opacity: 1; }
       input:focus { outline: none; border-color: var(--ink) !important; }
+      button { -webkit-tap-highlight-color: transparent; outline: none; }
+      button:focus, button:focus-visible, button:active { outline: none; }
 
       /* 핸드폰 모드 - 화면이 좁을 때 배열을 세로로 바꿔줌 */
       @media (max-width: 640px) {
