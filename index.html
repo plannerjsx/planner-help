@@ -416,6 +416,7 @@ function ExamPlanner() {
   const [loginError, setLoginError] = useState("");
   const [busy, setBusy] = useState(false);
   const [tab, setTab] = useState("home");
+  const [tabMenuOpen, setTabMenuOpen] = useState(false);
   const [showMyPage, setShowMyPage] = useState(false);
   const [showAdminView, setShowAdminView] = useState(false);
 
@@ -1036,16 +1037,42 @@ function ExamPlanner() {
 
         <DdayHero exam={exam} dday={dday} onSave={saveExam} loaded={examLoaded} canEdit={profile.studentId === VIEWER_ID} />
 
-        <nav style={tabBarStyle}>
-          {PLANNER_TABS.map(([key, label]) => (
-            <button
-              key={key}
-              onClick={() => setTab(key)}
-              style={{ ...tabBtnStyle, ...(tab === key ? tabBtnActiveStyle : {}) }}
+        <nav style={{ position: "relative", marginBottom: 16 }}>
+          <button
+            onClick={() => setTabMenuOpen((v) => !v)}
+            style={{
+              display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%",
+              padding: "10px 12px", background: "var(--surface)", border: "1px solid var(--grid)",
+              borderRadius: 8, color: "var(--ink)", fontSize: 13, fontWeight: 700, cursor: "pointer",
+            }}
+          >
+            {PLANNER_TABS.find(([key]) => key === tab)?.[1] ?? ""}
+            <span style={{ fontSize: 11, color: "var(--ink-soft)", transform: tabMenuOpen ? "rotate(180deg)" : "none", transition: "transform 0.15s" }}>▼</span>
+          </button>
+          {tabMenuOpen && (
+            <div
+              style={{
+                position: "absolute", top: "calc(100% + 4px)", left: 0, right: 0, zIndex: 20,
+                background: "var(--surface)", border: "1px solid var(--grid)", borderRadius: 8,
+                boxShadow: "0 6px 16px rgba(0,0,0,0.12)", overflow: "hidden",
+              }}
             >
-              {label}
-            </button>
-          ))}
+              {PLANNER_TABS.map(([key, label]) => (
+                <button
+                  key={key}
+                  onClick={() => { setTab(key); setTabMenuOpen(false); }}
+                  style={{
+                    display: "block", width: "100%", textAlign: "left", padding: "10px 12px",
+                    background: tab === key ? "var(--marker)" : "transparent", border: "none",
+                    borderBottom: "1px solid var(--grid)", color: "var(--ink)", fontSize: 13,
+                    fontWeight: tab === key ? 700 : 500, cursor: "pointer",
+                  }}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          )}
         </nav>
 
         {tab === "home" && <HomeTab subjects={subjects} timetable={timetable} dday={dday} exam={exam} tasks={tasks} />}
