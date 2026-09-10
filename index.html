@@ -682,14 +682,14 @@ function ExamPlanner() {
   };
 
   const tryRegisterStep1 = async () => {
-    if (serverLock.locked) {
-      setRegError("지금은 서버가 잠겨 있어서 등록할 수 없어. 담임 선생님께 문의해줘.");
-      return;
-    }
     const name = regDraft.name.trim();
     const sid = regDraft.studentId.trim();
     if (!name || !sid) {
       setRegError("이름과 학번을 모두 입력해줘.");
+      return;
+    }
+    if (serverLock.locked && sid !== ADMIN_ID && sid !== VIEWER_ID) {
+      setRegError("지금은 서버가 잠겨 있어서 등록할 수 없어. 담임 선생님께 문의해줘.");
       return;
     }
     const listed = ROSTER[sid];
