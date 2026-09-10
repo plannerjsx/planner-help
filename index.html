@@ -307,6 +307,14 @@ const EXAM_ROUNDS = [
 ];
 const DEFAULT_ROUND_KEY = "2-1";
 
+// 시험 시간표 - 시험범위와 같은 1차/2차 구분, 4일 × 교시별 과목(직접 입력)
+const EXAM_TIMETABLE_DAYS = ["1일차", "2일차", "3일차", "4일차"];
+const EXAM_TIMETABLE_PERIODS = [
+  { key: "p1", label: "1교시", checkIn: "8:55", time: "9:00~9:50" },
+  { key: "p2", label: "2교시", checkIn: "10:05", time: "10:10~11:00" },
+  { key: "p3", label: "3교시", checkIn: "11:15", time: "11:20~12:10" },
+];
+
 // 2026학년도 2학기 1차고사 (1학년) - 학사일정/시간표 기준 기본값
 // 서버(플래너) 실사용 시작일 - 이 날짜 이전은 활동 로그 통계(주간 달성률 등)에서 제외
 const SERVER_START_DATE = "2026-09-09";
@@ -514,6 +522,7 @@ function ExamPlanner() {
 
   // 시험범위 - 반 전체 공유, 지정된 학번만 수정 가능
   const [examScope, setExamScope] = useLocalState("examScope", {}, true);
+  const [examTimetable, setExamTimetable] = useLocalState("examTimetable", {}, true);
   const canEditScope = SCOPE_EDITOR_IDS.has(profile.studentId);
 
   // 공부명언 뽑기 - 명언 목록은 전체 공유, 사용자가 처음 로그인할 때 뽑은 명언은 계정별로 보관
@@ -1070,7 +1079,11 @@ function ExamPlanner() {
           <GradesTab scores={scores} setScores={setScores} />
         )}
         {tab === "scope" && (
-          <ExamScopeTab examScope={examScope} setExamScope={setExamScope} canEdit={canEditScope} />
+          <ExamScopeTab
+            examScope={examScope} setExamScope={setExamScope}
+            examTimetable={examTimetable} setExamTimetable={setExamTimetable}
+            canEdit={canEditScope}
+          />
         )}
         {tab === "board" && (
           <BoardTab
@@ -2255,12 +2268,15 @@ function GradesTab({ scores, setScores }) {
   );
 }
 
-function ExamScopeTab({ examScope, setExamScope, canEdit }) {
+function ExamScopeTab({ examScope, setExamScope, examTimetable, setExamTimetable, canEdit }) {
   const [roundKey, setRoundKey] = useState(SCOPE_ROUNDS[0]);
   const [draft, setDraft] = useState({});
   const [saved, setSaved] = useState(false);
+  const [ttDraft, setTtDraft] = useState([]);
+  const [ttSaved, setTtSaved] = useState(false);
   const roundLabel = (EXAM_ROUNDS.find((r) => r.key === roundKey) || {}).label || roundKey;
   const roundScope = examScope[roundKey] || {};
+  const roundTimetable = examTimetable[roundKey] || [];
 
   useEffect(() => {
     const next = {};
@@ -2269,10 +2285,33 @@ function ExamScopeTab({ examScope, setExamScope, canEdit }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roundKey, examScope]);
 
+  useEffect(() => {
+    const next = EXAM_TIMETABLE_DAYS.map((_, di) => {
+      const savedDay = roundTimetable[di] || [];
+      return EXAM_TIMETABLE_PERIODS.map((_, pi) => savedDay[pi] || "");
+    });
+    setTtDraft(next);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roundKey, examTimetable]);
+
   const save = async () => {
     await setExamScope({ ...examScope, [roundKey]: { ...draft } });
     setSaved(true);
     setTimeout(() => setSaved(false), 1500);
+  };
+
+  const updateTtCell = (dayIdx, periodIdx, value) => {
+    setTtDraft((prev) => {
+      const next = prev.map((day) => day.slice());
+      next[dayIdx][periodIdx] = value;
+      return next;
+    });
+  };
+
+  const saveTimetable = async () => {
+    await setExamTimetable({ ...examTimetable, [roundKey]: ttDraft });
+    setTtSaved(true);
+    setTimeout(() => setTtSaved(false), 1500);
   };
 
   return (
@@ -2311,6 +2350,46 @@ function ExamScopeTab({ examScope, setExamScope, canEdit }) {
         {canEdit && (
           <button style={{ ...primaryBtnStyle, marginTop: 6 }} onClick={save}>
             {saved ? "저장됨" : "저장"}
+          </button>
+        )}
+      </SectionCard>
+      <SectionCard
+        title={`${roundLabel} 시험 시간표`}
+        subtitle={canEdit ? "일차 · 교시별로 과목을 입력하고 저장을 눌러줘" : undefined}
+      >
+        <div className="week-cols" style={{ display: "flex", gap: 8, minWidth: 700 }}>
+          {EXAM_TIMETABLE_DAYS.map((dayLabel, di) => (
+            <div key={dayLabel} style={weekColStyle}>
+              <p style={{ fontSize: 13, fontWeight: 800, color: "var(--ink)", margin: "0 0 8px" }}>{dayLabel}</p>
+              {EXAM_TIMETABLE_PERIODS.map((p, pi) => {
+                const value = (ttDraft[di] && ttDraft[di][pi]) || "";
+                const savedValue = (roundTimetable[di] && roundTimetable[di][pi]) || "";
+                return (
+                  <div key={p.key} style={{ marginBottom: 10 }}>
+                    <p style={{ fontSize: 11, color: "var(--ink-soft)", margin: "0 0 3px" }}>
+                      {p.label} · 입실 {p.checkIn} · {p.time}
+                    </p>
+                    {canEdit ? (
+                      <input
+                        value={value}
+                        onChange={(e) => updateTtCell(di, pi, e.target.value)}
+                        placeholder="과목"
+                        style={weekInputStyle}
+                      />
+                    ) : (
+                      <p style={{ fontSize: 13, color: savedValue ? "var(--ink)" : "var(--ink-soft)", margin: 0 }}>
+                        {savedValue || "미정"}
+                      </p>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+        </div>
+        {canEdit && (
+          <button style={{ ...primaryBtnStyle, marginTop: 10 }} onClick={saveTimetable}>
+            {ttSaved ? "저장됨" : "저장"}
           </button>
         )}
       </SectionCard>
