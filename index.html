@@ -170,6 +170,7 @@
       }
       try {
         const keys = [];
+        const documents = [];
         let pageToken = "";
         do {
           const url =
@@ -181,11 +182,14 @@
           usageAdd("read", JSON.stringify(data).length);
           (data.documents || []).forEach((d) => {
             const id = d.name.split("/").pop();
-            if (!prefix || id.startsWith(prefix)) keys.push(id);
+            if (!prefix || id.startsWith(prefix)) {
+              keys.push(id);
+              documents.push(d);
+            }
           });
           pageToken = data.nextPageToken || "";
         } while (pageToken);
-        return { keys, prefix, shared: true };
+        return { keys, documents, prefix, shared: true };
       } catch (e) {
         console.error("storage.list 실패", prefix, e);
         return { keys: [], prefix, shared: true };
@@ -324,10 +328,28 @@ const DEFAULT_ROUND_KEY = "2-1";
 
 // 시험목표는 2학기 1차/2차만 사용하고, 과목은 기존 7과목을 그대로 사용
 const GOAL_ROUNDS = EXAM_ROUNDS.filter((r) => r.key === "2-1" || r.key === "2-2");
-const DEFAULT_GOAL_PERIODS = {
-  "2-1": { start: "", end: "" },
-  "2-2": { start: "", end: "" },
-};
+// 시험목표는 관리자가 기간을 설정하지 않고, 시험 시작 전날까지 입력 가능
+// 2-1은 현재 등록된 시험일을 사용하고, 2-2는 학사일정에 시험일이 추가되면 자동으로 적용됨
+function getGoalExamDate(roundKey) {
+  const event = SCHOOL_EVENTS.find((e) =>
+    e.kind === "exam" && (roundKey === "2-1" ? e.label.includes("2학기 1차고사") : e.label.includes("2학기 2차고사"))
+  );
+  if (event) return event.date;
+  if (roundKey === "2-1") return DEFAULT_EXAM.date;
+  return "";
+}
+function isGoalOpen(roundKey) {
+  const examDate = getGoalExamDate(roundKey);
+  if (!examDate) return true;
+  return toKey(new Date()) < examDate;
+}
+function goalDeadlineText(roundKey) {
+  const examDate = getGoalExamDate(roundKey);
+  if (!examDate) return "시험일이 등록되면 시험 전날까지 자동으로 마감돼.";
+  const d = new Date(examDate + "T00:00:00");
+  d.setDate(d.getDate() - 1);
+  return `시험 전날(${toKey(d)})까지 작성 가능 · 시험 시작 후 변경 불가`;
+}
 
 
 // 시험 시간표 - 시험범위와 같은 1차/2차 구분, 4일 × 교시별 과목(직접 입력)
@@ -544,7 +566,6 @@ function ExamPlanner() {
   // 시험목표: 학번별·회차별 목표점수. setAt으로 설정일을 기록해 통계 공개 시점을 제어한다.
   const [goalScores, setGoalScores] = useLocalState(`goalScores:${dataOwner}`, {}, true);
   const [singleGoalScores, setSingleGoalScores] = useLocalState(`singleGoalScores:${dataOwner}`, {}, true);
-  const [goalPeriods, setGoalPeriods] = useLocalState("goalPeriods", DEFAULT_GOAL_PERIODS, true);
   const [notes, setNotes] = useLocalState(`notes:${dataOwner}`, [], true);
 
   // 시험범위 - 반 전체 공유, 지정된 학번만 수정 가능
@@ -554,10 +575,10 @@ function ExamPlanner() {
 
   // 공부명언 뽑기 - 명언 목록은 전체 공유, 사용자가 처음 로그인할 때 뽑은 명언은 계정별로 보관
   const [quotes, setQuotes, quotesLoaded] = useLocalState("quotes", DEFAULT_QUOTES, true);
-  const [myQuote, setMyQuote, myQuoteLoaded] = useLocalState(`quotePick:${dataOwner}`, { picked: false, text: "" }, true);
+  const [myQuote, setMyQuote, myQuoteLoaded] = useLocalState(`quotePick:${dataOwner}`, { date: "", picked: false, text: "" }, true);
   const addQuote = (text) => setQuotes([...quotes, { id: uid(), text }]);
   const removeQuote = (id) => setQuotes(quotes.filter((q) => q.id !== id));
-  const pickMyQuote = (text) => setMyQuote({ picked: true, text });
+  const pickMyQuote = (text) => setMyQuote({ date: toKey(new Date()), picked: true, text });
 
   const [focusMonth, setFocusMonth] = useState(() => { const d = new Date(); return { year: d.getFullYear(), month: d.getMonth() }; });
 
@@ -602,22 +623,28 @@ function ExamPlanner() {
   const loadClassGoals = useCallback(async () => {
     setGoalsLoading(true);
     try {
+      // list()가 반환하는 documents를 바로 사용한다. 학생별 get()을 반복하지 않아
+      // 최신 목표점수가 누락되거나 요청이 과도하게 발생하는 문제를 막는다.
       const listed = await window.storage.list("goalScores:", true);
-      const keys = listed && listed.keys ? listed.keys : [];
       const entries = {};
-      for (const k of keys) {
+      for (const d of (listed?.documents || [])) {
         try {
-          const r = await window.storage.get(k, true);
-          if (r) entries[k.slice("goalScores:".length)] = JSON.parse(r.value);
+          const key = d?.name ? d.name.split("/").pop() : "";
+          if (!key.startsWith("goalScores:")) continue;
+          const decoded = decodeFields(d.fields || {});
+          if (decoded?.value != null) entries[key.slice("goalScores:".length)] = JSON.parse(decoded.value);
         } catch (e) {}
       }
       setClassGoals(entries);
+
       const singleListed = await window.storage.list("singleGoalScores:", true);
       const singleEntries = {};
-      for (const k of (singleListed?.keys || [])) {
+      for (const d of (singleListed?.documents || [])) {
         try {
-          const r = await window.storage.get(k, true);
-          if (r) singleEntries[k.slice("singleGoalScores:".length)] = JSON.parse(r.value);
+          const key = d?.name ? d.name.split("/").pop() : "";
+          if (!key.startsWith("singleGoalScores:")) continue;
+          const decoded = decodeFields(d.fields || {});
+          if (decoded?.value != null) singleEntries[key.slice("singleGoalScores:".length)] = JSON.parse(decoded.value);
         } catch (e) {}
       }
       setClassSingleGoals(singleEntries);
@@ -1008,8 +1035,6 @@ function ExamPlanner() {
             reloadTasks={loadAllTasks}
             goalScores={classGoals}
             singleGoalScores={classSingleGoals}
-            goalPeriods={goalPeriods}
-            setGoalPeriods={setGoalPeriods}
             quotes={quotes}
             onAddQuote={addQuote}
             onRemoveQuote={removeQuote}
@@ -1045,8 +1070,6 @@ function ExamPlanner() {
             classSingleGoals={classSingleGoals}
             goalsLoading={goalsLoading}
             reloadGoals={loadClassGoals}
-            goalPeriods={goalPeriods}
-            setGoalPeriods={setGoalPeriods}
             allTasks={allTasks}
             tasksLoading={tasksLoading}
             reloadTasks={loadAllTasks}
@@ -1152,7 +1175,6 @@ function ExamPlanner() {
             setGoalScores={setGoalScores}
             singleGoalScores={singleGoalScores}
             setSingleGoalScores={setSingleGoalScores}
-            goalPeriods={goalPeriods}
             studentId={profile.studentId}
           />
         )}
@@ -1177,10 +1199,12 @@ function ExamPlanner() {
   );
 }
 
-// 공부명언 뽑기: 아직 안 뽑았으면 카드 5장을 보여주는 오버레이, 이미 뽑았으면 상단 배너로 계속 표시
+// 공부명언 뽑기: 날짜별로 하루 한 번. 당일 첫 로그인 시 뽑고, 다음 날에는 다시 뽑을 수 있음.
 function DailyQuote({ quotesLoaded, quotes, myQuote, myQuoteLoaded, onPick }) {
   if (!myQuoteLoaded || !quotesLoaded) return null;
-  if (myQuote.picked) {
+  const today = toKey(new Date());
+  const pickedToday = !!myQuote?.picked && myQuote?.date === today && !!myQuote?.text;
+  if (pickedToday) {
     return (
       <div style={quoteBannerStyle}>
         <span style={{ fontWeight: 700, marginRight: 8 }}>오늘의 명언</span>
@@ -1189,7 +1213,7 @@ function DailyQuote({ quotesLoaded, quotes, myQuote, myQuoteLoaded, onPick }) {
     );
   }
   if (!quotes.length) return null;
-  return <QuoteDrawOverlay quotes={quotes} onPick={onPick} />;
+  return <QuoteDrawOverlay key={today} quotes={quotes} onPick={onPick} />;
 }
 
 function QuoteDrawOverlay({ quotes, onPick }) {
@@ -2233,11 +2257,7 @@ function NotesTab({ notes, setNotes }) {
   );
 }
 
-function isGoalPeriodOpen(period) {
-  if (!period || !period.start || !period.end) return false;
-  const today = toKey(new Date());
-  return today >= period.start && today <= period.end;
-}
+
 
 function isAfterSetDay(setAt) {
   if (!setAt) return false;
@@ -2247,15 +2267,14 @@ function isAfterSetDay(setAt) {
   return today >= new Date(next.getFullYear(), next.getMonth(), next.getDate());
 }
 
-function ExamGoalTab({ goalScores, setGoalScores, singleGoalScores, setSingleGoalScores, goalPeriods, studentId }) {
+function ExamGoalTab({ goalScores, setGoalScores, singleGoalScores, setSingleGoalScores, studentId }) {
   const [roundKey, setRoundKey] = useState("2-1");
   const [draft, setDraft] = useState({});
   const [msg, setMsg] = useState("");
   const round = GOAL_ROUNDS.find((r) => r.key === roundKey) || GOAL_ROUNDS[0];
   const current = goalScores[roundKey];
-  const period = goalPeriods[roundKey] || {};
   const locked = !!current?.setAt;
-  const open = isGoalPeriodOpen(period);
+  const open = isGoalOpen(roundKey);
   const revealed = locked && isAfterSetDay(current.setAt);
   const singleCurrent = singleGoalScores?.[roundKey];
   const [singleSubject, setSingleSubject] = useState(round.subjects[0]);
@@ -2326,11 +2345,7 @@ function ExamGoalTab({ goalScores, setGoalScores, singleGoalScores, setSingleGoa
 
       <SectionCard
         title={`${round.label} 시험목표`}
-        subtitle={
-          !period.start || !period.end
-            ? "아직 관리자가 목표 설정 기간을 정하지 않았어."
-            : `${period.start} ~ ${period.end}`
-        }
+        subtitle={goalDeadlineText(roundKey)}
       >
         {round.subjects.map((s) => (
           <div key={s} style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 9, flexWrap: "wrap" }}>
@@ -2356,7 +2371,7 @@ function ExamGoalTab({ goalScores, setGoalScores, singleGoalScores, setSingleGoa
         )}
         <p style={{ fontSize: 12, color: msg ? "var(--coral)" : "var(--ink-soft)", margin: "10px 0 0" }}>
           {msg || (locked ? "목표점수는 한 번 확정하면 변경할 수 없어." :
-            !open ? "관리자가 정한 기간에만 목표점수를 설정할 수 있어." :
+            !open ? "시험 전날까지 목표점수를 설정할 수 있어." :
             "7과목을 모두 입력한 뒤 확정해줘. 확정 후에는 수정할 수 없어.")}
         </p>
       </SectionCard>
@@ -2378,11 +2393,11 @@ function ExamGoalTab({ goalScores, setGoalScores, singleGoalScores, setSingleGoa
             onChange={(e) => setSingleDraft(e.target.value)}
             style={{ ...inputStyle, width: 110, height: 34, opacity: singleLocked || !open ? 0.65 : 1 }}
           />
-          {!singleLocked && <button style={primaryBtnStyle} disabled={!open} onClick={saveSingleTarget}>한 과목 목표 확정</button>}
+          {!singleLocked && <button style={primaryBtnStyle} disabled={!open || singleDraft === ""} onClick={saveSingleTarget}>한 과목 목표 확정</button>}
           {singleLocked && <span style={{ fontSize: 12, color: "var(--ink-soft)" }}>{singleCurrent.subject} {singleCurrent.score}점 · 설정 완료</span>}
         </div>
         <p style={{ fontSize: 12, color: singleMsg ? "var(--coral)" : "var(--ink-soft)", margin: "10px 0 0" }}>
-          {singleMsg || (singleLocked ? "한 과목 목표는 한 번 확정하면 변경할 수 없어." : !open ? "관리자가 정한 기간에만 설정할 수 있어." : "7과목 목표와 독립적으로 설정돼.")}
+          {singleMsg || (singleLocked ? (isGoalOpen(roundKey) ? "한 과목 목표는 한 번 확정하면 변경할 수 없어." : "시험이 시작되어 변경할 수 없어.") : !open ? "시험이 시작되어 목표를 설정할 수 없어." : "7과목 목표와 독립적으로 설정돼.")}
         </p>
       </SectionCard>
 
@@ -2809,7 +2824,7 @@ function MyPageTab({ profile, subjects, exam, onLogout, canOpenAdminView, onOpen
   );
 }
 
-function AdminPanel({ accounts, setAccounts, accountsLoading, accountsLoadError, reloadAccounts, allTasks, tasksLoading, reloadTasks, goalScores, singleGoalScores, goalPeriods, setGoalPeriods, quotes, onAddQuote, onRemoveQuote }) {
+function AdminPanel({ accounts, setAccounts, accountsLoading, accountsLoadError, reloadAccounts, allTasks, tasksLoading, reloadTasks, goalScores, singleGoalScores, quotes, onAddQuote, onRemoveQuote }) {
   const [innerTab, setInnerTab] = useState("accounts"); // accounts | goals | activity | quotes
   const [rowBusy, setRowBusy] = useState({});
   const [rowMsg, setRowMsg] = useState({});
@@ -2849,12 +2864,6 @@ function AdminPanel({ accounts, setAccounts, accountsLoading, accountsLoadError,
         </button>
         <button onClick={() => setInnerTab("activity")} style={{ ...tabBtnStyle, ...(innerTab === "activity" ? tabBtnActiveStyle : {}) }}>
           활동 로그
-        </button>
-        <button onClick={() => setInnerTab("goalmanage")} style={{ ...tabBtnStyle, ...(innerTab === "goalmanage" ? tabBtnActiveStyle : {}) }}>
-          시험목표 관리
-        </button>
-        <button onClick={() => setInnerTab("firebase")} style={{ ...tabBtnStyle, ...(innerTab === "firebase" ? tabBtnActiveStyle : {}) }}>
-          Firebase 사용량
         </button>
         <button onClick={() => setInnerTab("quotes")} style={{ ...tabBtnStyle, ...(innerTab === "quotes" ? tabBtnActiveStyle : {}) }}>
           명언 관리
@@ -2925,8 +2934,6 @@ function AdminPanel({ accounts, setAccounts, accountsLoading, accountsLoadError,
           students={students}
           goalScores={goalScores}
           singleGoalScores={singleGoalScores}
-          goalPeriods={goalPeriods}
-          setGoalPeriods={setGoalPeriods}
         />
       )}
 
@@ -2943,8 +2950,6 @@ function AdminPanel({ accounts, setAccounts, accountsLoading, accountsLoadError,
           students={students}
           goalScores={classGoals}
           singleGoalScores={classSingleGoals}
-          goalPeriods={goalPeriods}
-          setGoalPeriods={setGoalPeriods}
         />
       )}
       {innerTab === "firebase" && <FirebaseUsagePanel />}
@@ -2952,57 +2957,34 @@ function AdminPanel({ accounts, setAccounts, accountsLoading, accountsLoadError,
   );
 }
 
-function GoalAdminPanel({ students, goalScores, singleGoalScores, goalPeriods, setGoalPeriods }) {
-  const [draft, setDraft] = useState(goalPeriods || DEFAULT_GOAL_PERIODS);
+function GoalAdminPanel({ students, goalScores, singleGoalScores }) {
   const [msg, setMsg] = useState("");
 
-  useEffect(() => setDraft(goalPeriods || DEFAULT_GOAL_PERIODS), [goalPeriods]);
-
-  const savePeriod = async (roundKey) => {
-    const p = draft[roundKey] || {};
-    if (!p.start || !p.end || p.start > p.end) {
-      setMsg("시작일과 종료일을 올바르게 입력해줘.");
-      return;
-    }
-    await setGoalPeriods({ ...draft, [roundKey]: p });
-    setMsg(`${roundKey === "2-1" ? "2학기 1차" : "2학기 2차"} 목표 설정 기간을 저장했어.`);
-  };
-
   const resetStudentGoal = async (sid, roundKey) => {
+    const label = roundKey === "2-1" ? "2학기 1차" : "2학기 2차";
+    if (!window.confirm(`${sid} 학생의 ${label} 7과목 목표점수를 초기화할까?`)) return;
     const current = goalScores?.[sid] || {};
     const next = { ...current };
     delete next[roundKey];
-    await window.storage.set(`goalScores:${sid}`, JSON.stringify(next), true);
+    await window.storage.delete(`goalScores:${sid}`, true);
     setMsg(`${sid}의 ${roundKey === "2-1" ? "2학기 1차" : "2학기 2차"} 목표를 초기화했어.`);
     window.location.reload();
   };
   const resetStudentSingleGoal = async (sid, roundKey) => {
+    const label = roundKey === "2-1" ? "2학기 1차" : "2학기 2차";
+    if (!window.confirm(`${sid} 학생의 ${label} 한 과목 목표점수를 초기화할까?`)) return;
     const current = singleGoalScores?.[sid] || {};
     const next = { ...current };
     delete next[roundKey];
-    await window.storage.set(`singleGoalScores:${sid}`, JSON.stringify(next), true);
+    await window.storage.delete(`singleGoalScores:${sid}`, true);
     setMsg(`${sid}의 ${roundKey === "2-1" ? "2학기 1차" : "2학기 2차"} 한 과목 목표를 초기화했어.`);
     window.location.reload();
   };
 
   return (
     <div>
-      <SectionCard title="시험목표 기간 설정" subtitle="관리자가 설정한 기간 안에서만 학생이 목표점수를 입력할 수 있어.">
-        {GOAL_ROUNDS.map((r) => {
-          const p = draft[r.key] || {};
-          return (
-            <div key={r.key} style={{ ...adminRowStyle, marginBottom: 10 }}>
-              <div style={{ fontWeight: 700, marginBottom: 8 }}>{r.label}</div>
-              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-                <input type="date" value={p.start || ""} onChange={(e) => setDraft({ ...draft, [r.key]: { ...p, start: e.target.value } })} style={{ ...inputStyle, width: 150, height: 34 }} />
-                <span>~</span>
-                <input type="date" value={p.end || ""} onChange={(e) => setDraft({ ...draft, [r.key]: { ...p, end: e.target.value } })} style={{ ...inputStyle, width: 150, height: 34 }} />
-                <button style={ghostBtnStyle} onClick={() => savePeriod(r.key)}>기간 저장</button>
-              </div>
-            </div>
-          );
-        })}
-        {msg && <p style={{ fontSize: 12, color: "var(--teal)", margin: "8px 0 0" }}>{msg}</p>}
+      <SectionCard title="시험목표 관리" subtitle="학생은 시험 전날까지 목표를 설정할 수 있고, 시험이 시작되면 목표점수를 변경할 수 없어.">
+        <p style={{ fontSize: 12, color: "var(--ink-soft)", margin: "0" }}>{goalDeadlineText("2-1")} · {goalDeadlineText("2-2")}</p>
       </SectionCard>
 
       <SectionCard title="학생별 목표 초기화" subtitle="초기화하면 해당 학생이 다시 목표를 설정할 수 있어.">
@@ -3026,10 +3008,10 @@ function GoalAdminPanel({ students, goalScores, singleGoalScores, goalPeriods, s
                 </div>
               )}
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                <button style={{ ...ghostBtnStyle, height: 32 }} disabled={!has1} onClick={() => resetStudentGoal(id, "2-1")}>1차 초기화</button>
-                <button style={{ ...ghostBtnStyle, height: 32 }} disabled={!has2} onClick={() => resetStudentGoal(id, "2-2")}>2차 초기화</button>
-                <button style={{ ...ghostBtnStyle, height: 32 }} disabled={!singleGoalScores?.[id]?.["2-1"]?.setAt} onClick={() => resetStudentSingleGoal(id, "2-1")}>1차 한 과목 초기화</button>
-                <button style={{ ...ghostBtnStyle, height: 32 }} disabled={!singleGoalScores?.[id]?.["2-2"]?.setAt} onClick={() => resetStudentSingleGoal(id, "2-2")}>2차 한 과목 초기화</button>
+                {has1 && <button style={{ ...ghostBtnStyle, height: 32 }} onClick={() => resetStudentGoal(id, "2-1")}>1차 초기화</button>}
+                {has2 && <button style={{ ...ghostBtnStyle, height: 32 }} onClick={() => resetStudentGoal(id, "2-2")}>2차 초기화</button>}
+                {singleGoalScores?.[id]?.["2-1"]?.setAt && <button style={{ ...ghostBtnStyle, height: 32 }} onClick={() => resetStudentSingleGoal(id, "2-1")}>1차 한 과목 초기화</button>}
+                {singleGoalScores?.[id]?.["2-2"]?.setAt && <button style={{ ...ghostBtnStyle, height: 32 }} onClick={() => resetStudentSingleGoal(id, "2-2")}>2차 한 과목 초기화</button>}
               </div>
               {(singleGoalScores?.[id]?.["2-1"]?.setAt || singleGoalScores?.[id]?.["2-2"]?.setAt) && (
                 <div style={{ fontSize: 12, color: "var(--ink-soft)", marginTop: 7 }}>
@@ -3057,35 +3039,43 @@ function formatBytes(bytes) {
 
 function FirebaseUsagePanel() {
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [checked, setChecked] = useState(false);
   const [data, setData] = useState({ docs: 0, bytes: 0, byPrefix: [] });
   const [session, setSession] = useState(() => ({ ...(window.firebaseUsage || {}) }));
 
+  // Firebase 사용량 화면에 들어왔다고 자동으로 전체 Firestore를 조회하지 않는다.
+  // 전체 문서 조회는 문서 수가 많을 때 브라우저가 멈추는 원인이 될 수 있다.
   const refresh = async () => {
+    if (loading) return;
     setLoading(true);
+    setError("");
     try {
       const listed = await window.storage.list("", true);
-      const keys = listed?.keys || [];
+      const docs = Array.isArray(listed?.documents) ? listed.documents : [];
       let bytes = 0;
       const groups = {};
-      for (const k of keys) {
-        try {
-          const r = await window.storage.get(k, true);
-          const raw = r?.value ?? "";
-          const size = new Blob([String(raw)]).size;
-          bytes += size;
-          const prefix = k.includes(":") ? k.split(":")[0] + ":" : "(기타)";
-          groups[prefix] = (groups[prefix] || 0) + size;
-        } catch (e) {}
+      for (const d of docs) {
+        const id = d?.name ? d.name.split("/").pop() : "";
+        const raw = JSON.stringify(d?.fields || {});
+        const size = new Blob([raw]).size;
+        bytes += size;
+        const prefix = id.includes(":") ? id.split(":")[0] + ":" : "(기타)";
+        groups[prefix] = (groups[prefix] || 0) + size;
       }
-      const byPrefix = Object.entries(groups).sort((a,b) => b[1] - a[1]).map(([prefix,size]) => ({ prefix, size }));
-      setData({ docs: keys.length, bytes, byPrefix });
+      const byPrefix = Object.entries(groups)
+        .sort((a, b) => b[1] - a[1])
+        .map(([prefix, size]) => ({ prefix, size }));
+      setData({ docs: docs.length, bytes, byPrefix });
       setSession({ ...(window.firebaseUsage || {}) });
+      setChecked(true);
+    } catch (e) {
+      console.error("Firebase 사용량 확인 실패", e);
+      setError("Firebase 사용량을 불러오지 못했어. 다른 기능에는 영향을 주지 않아.");
     } finally {
       setLoading(false);
     }
   };
-
-  useEffect(() => { refresh(); }, []);
 
   useEffect(() => {
     const id = setInterval(() => setSession({ ...(window.firebaseUsage || {}) }), 1000);
@@ -3094,31 +3084,36 @@ function FirebaseUsagePanel() {
 
   return (
     <div>
-      <SectionCard title="Firebase 사용량" subtitle="10816 전용 · 현재 Firestore에 저장된 데이터의 대략적인 크기와 이 브라우저 세션의 요청량을 보여줘.">
+      <SectionCard title="Firebase 사용량" subtitle="10816 전용 · 필요할 때만 Firestore 문서를 조회해." >
         <div className="grid-row-mobile" style={gridRow}>
-          <MetricCard label="저장 문서" value={`${data.docs}개`} accent="var(--ink)" />
-          <MetricCard label="저장 데이터(대략)" value={formatBytes(data.bytes)} accent="var(--teal)" />
+          <MetricCard label="저장 문서" value={checked ? `${data.docs}개` : "조회 전"} accent="var(--ink)" />
+          <MetricCard label="저장 데이터(대략)" value={checked ? formatBytes(data.bytes) : "조회 전"} accent="var(--teal)" />
           <MetricCard label="세션 읽기" value={`${session.reads || 0}회`} accent="var(--ink)" />
           <MetricCard label="세션 쓰기" value={`${session.writes || 0}회`} accent="var(--ink)" />
           <MetricCard label="세션 삭제" value={`${session.deletes || 0}회`} accent="var(--coral)" />
           <MetricCard label="세션 응답량" value={formatBytes(session.bytes || 0)} accent="var(--ink)" />
         </div>
         <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
-          <button style={ghostBtnStyle} onClick={refresh} disabled={loading}>{loading ? "계산 중..." : "사용량 새로고침"}</button>
+          <button style={ghostBtnStyle} onClick={refresh} disabled={loading}>
+            {loading ? "조회 중..." : (checked ? "사용량 다시 확인" : "Firebase 사용량 확인")}
+          </button>
         </div>
+        {error && <p style={errorTextStyle}>{error}</p>}
         <p style={{ fontSize: 12, color: "var(--ink-soft)", margin: "0 0 12px" }}>
-          주의: 이 화면의 저장 데이터 크기는 Firestore 문서 내용을 기준으로 계산한 대략값이야. Firebase 콘솔의 과금·할당량 수치와는 다를 수 있어.
+          자동 전체 조회를 막아 Firebase 문서가 많아도 화면이 멈추지 않게 했어. 아래 버튼을 눌렀을 때만 대략적인 사용량을 계산해.
         </p>
-        <div style={{ overflowX: "auto" }}>
-          <table style={overviewTableStyle}>
-            <thead><tr><th style={overviewHeadCell}>데이터 종류</th><th style={overviewHeadCell}>대략 크기</th></tr></thead>
-            <tbody>
-              {data.byPrefix.map(([prefix, size]) => (
-                <tr key={prefix}><td style={{ ...overviewCell, fontWeight: 700 }}>{prefix}</td><td style={overviewCell}>{formatBytes(size)}</td></tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        {checked && (
+          <div style={{ overflowX: "auto" }}>
+            <table style={overviewTableStyle}>
+              <thead><tr><th style={overviewHeadCell}>데이터 종류</th><th style={overviewHeadCell}>대략 크기</th></tr></thead>
+              <tbody>
+                {data.byPrefix.map(({ prefix, size }) => (
+                  <tr key={prefix}><td style={{ ...overviewCell, fontWeight: 700 }}>{prefix}</td><td style={overviewCell}>{formatBytes(size)}</td></tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </SectionCard>
     </div>
   );
@@ -3126,7 +3121,7 @@ function FirebaseUsagePanel() {
 
 function ViewerPanel({
   accounts, setAccounts, accountsLoading, accountsLoadError, reloadAccounts,
-  classGoals, classSingleGoals, goalsLoading, reloadGoals, goalPeriods, setGoalPeriods, allTasks, tasksLoading, reloadTasks,
+  classGoals, classSingleGoals, goalsLoading, reloadGoals, allTasks, tasksLoading, reloadTasks,
   quotes, onAddQuote, onRemoveQuote,
   serverLock, serverLockLoaded, onToggleServerLock, onResetAllData, resetBusy, resetMsg,
   onResetDaily, resetDailyBusy, resetDailyMsg, onResetBoard, resetBoardBusy, resetBoardMsg,
@@ -3163,6 +3158,9 @@ function ViewerPanel({
         <button onClick={() => setInnerTab("server")} style={{ ...tabBtnStyle, ...(innerTab === "server" ? tabBtnActiveStyle : {}) }}>
           서버 관리
         </button>
+        <button onClick={() => setInnerTab("firebase")} style={{ ...tabBtnStyle, ...(innerTab === "firebase" ? tabBtnActiveStyle : {}) }}>
+          Firebase 사용량
+        </button>
       </nav>
 
       {innerTab === "quotes" && (
@@ -3190,14 +3188,16 @@ function ViewerPanel({
         />
       )}
 
+      {innerTab === "firebase" && <FirebaseUsagePanel />}
+
       {innerTab === "stats" && (
         <GoalOverviewPanel
           students={students}
           accounts={accounts}
           accountsLoading={accountsLoading}
           classGoals={classGoals}
+          classSingleGoals={classSingleGoals}
           goalsLoading={goalsLoading}
-          goalPeriods={goalPeriods}
           onReload={() => { reloadAccounts(); reloadGoals(); }}
         />
       )}
@@ -3556,23 +3556,55 @@ function ActivityLogPanel({ students, allTasks, tasksLoading, onReload }) {
   );
 }
 
-function GoalOverviewPanel({ students, accounts, accountsLoading, classGoals, goalsLoading, goalPeriods, onReload }) {
+function GoalOverviewPanel({ students, accounts, accountsLoading, classGoals, classSingleGoals, goalsLoading, onReload }) {
   const [roundKey, setRoundKey] = useState("2-1");
+  const [resetBusy, setResetBusy] = useState({});
   const round = GOAL_ROUNDS.find((r) => r.key === roundKey) || GOAL_ROUNDS[0];
 
-  const rows = round.subjects.map((subject) => {
-    const values = Object.values(classGoals || {})
-      .filter((g) => isAfterSetDay(g?.setAt))
-      .map((g) => g?.[roundKey]?.[subject])
-      .filter((v) => typeof v === "number");
+  const studentRows = students.map(([id, name]) => {
+    const full = classGoals?.[id]?.[roundKey] || {};
+    const single = classSingleGoals?.[id]?.[roundKey] || {};
+    return { id, name, full, single };
+  });
+
+  const toScore = (v) => {
+    const n = typeof v === "number" ? v : Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+
+  const subjectRows = round.subjects.map((subject) => {
+    const values = studentRows.map((r) => toScore(r.full?.[subject])).filter((v) => v != null);
     const avg = values.length ? Math.round(values.reduce((a,b) => a+b,0) / values.length * 10) / 10 : null;
     const max = values.length ? Math.max(...values) : null;
     const min = values.length ? Math.min(...values) : null;
     return { subject, avg, max, min, count: values.length };
   });
 
+  const resetOne = async (sid, type) => {
+    const key = `${sid}:${roundKey}:${type}`;
+    if (resetBusy[key]) return;
+    const label = roundKey === "2-1" ? "2학기 1차" : "2학기 2차";
+    const isSingle = type === "single";
+    const message = `${sid} 학생의 ${label} ${isSingle ? "한 과목" : "7과목"} 목표점수를 초기화할까?`;
+    if (!window.confirm(message)) return;
+    setResetBusy((v) => ({ ...v, [key]: true }));
+    try {
+      const prefix = isSingle ? "singleGoalScores:" : "goalScores:";
+      const currentMap = isSingle ? (classSingleGoals?.[sid] || {}) : (classGoals?.[sid] || {});
+      const next = { ...currentMap };
+      delete next[roundKey];
+      const result = await window.storage.delete(`${prefix}${sid}`, true);
+      if (!result) throw new Error("delete failed");
+      await onReload();
+    } catch (e) {
+      alert("초기화에 실패했어. 다시 시도해줘.");
+    } finally {
+      setResetBusy((v) => ({ ...v, [key]: false }));
+    }
+  };
+
   return (
-    <SectionCard title="전체 목표 통계표" subtitle={accountsLoading || goalsLoading ? "불러오는 중..." : "개인별 목표점수는 표시하지 않고 익명 집계만 제공"}>
+    <div>
       <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
         <button style={ghostBtnStyle} onClick={onReload} disabled={accountsLoading || goalsLoading}>새로고침</button>
         {GOAL_ROUNDS.map((r) => (
@@ -3581,32 +3613,85 @@ function GoalOverviewPanel({ students, accounts, accountsLoading, classGoals, go
           </button>
         ))}
       </div>
-      <p style={{ fontSize: 12, color: "var(--ink-soft)", margin: "0 0 10px" }}>
-        공개 기준: 학생이 목표를 설정한 다음날부터 통계에 포함돼.
-      </p>
-      <div style={{ overflowX: "auto" }}>
-        <table style={overviewTableStyle}>
-          <thead><tr>
-            <th style={overviewHeadCell}>과목</th>
-            <th style={overviewHeadCell}>평균 목표</th>
-            <th style={overviewHeadCell}>최고 목표</th>
-            <th style={overviewHeadCell}>최저 목표</th>
-            <th style={overviewHeadCell}>참여자</th>
-          </tr></thead>
-          <tbody>
-            {rows.map((r) => (
-              <tr key={r.subject}>
-                <td style={{ ...overviewCell, fontWeight: 700 }}>{r.subject}</td>
-                <td style={overviewCell}>{r.avg == null ? "-" : `${r.avg}점`}</td>
-                <td style={overviewCell}>{r.max == null ? "-" : `${r.max}점`}</td>
-                <td style={overviewCell}>{r.min == null ? "-" : `${r.min}점`}</td>
-                <td style={overviewCell}>{r.count}명</td>
-              </tr>
+
+      <div className="goal-admin-split" style={{ display: "grid", gridTemplateColumns: "minmax(300px, .85fr) minmax(520px, 1.5fr)", gap: 14, alignItems: "start" }}>
+        <SectionCard title="과목 목표점수" subtitle="실제로 저장된 학생 목표점수를 기준으로 참여 인원을 계산해.">
+          <div style={{ width: "100%", height: 320 }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={subjectRows} margin={{ top: 18, right: 12, left: 0, bottom: 8 }}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="subject" tick={{ fontSize: 11 }} />
+                <YAxis domain={[0, 100]} tick={{ fontSize: 11 }} />
+                <Tooltip formatter={(value) => [`${value}점`, "평균 목표점수"]} />
+                <Bar dataKey="avg" name="평균 목표점수" radius={[5, 5, 0, 0]}
+                  label={({ x, y, width, value, index }) => {
+                    const row = subjectRows[index];
+                    return row && typeof value === "number" ? <text x={x + width / 2} y={y - 8} textAnchor="middle" fontSize={10} fill="var(--ink)">참여 {row.count}명</text> : null;
+                  }}
+                />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 8, marginTop: 8 }}>
+            {subjectRows.map((r) => (
+              <div key={r.subject} style={{ padding: "8px 10px", border: "1px solid var(--grid)", borderRadius: 8 }}>
+                <div style={{ fontSize: 11, color: "var(--ink-soft)" }}>{r.subject} · 참여 {r.count}명</div>
+                <div style={{ fontSize: 14, fontWeight: 800, marginTop: 3 }}>{r.avg == null ? "-" : `${r.avg}점`}</div>
+                <div style={{ fontSize: 11, color: "var(--ink-soft)", marginTop: 2 }}>최고 {r.max == null ? "-" : `${r.max}점`} · 최저 {r.min == null ? "-" : `${r.min}점`}</div>
+              </div>
             ))}
-          </tbody>
-        </table>
+          </div>
+        </SectionCard>
+
+        <SectionCard title="우리반 점수표" subtitle="10800은 제외하고, 우리 반 학생 전체를 표시해. 10816도 포함돼.">
+          <div style={{ overflowX: "auto" }}>
+            <table style={overviewTableStyle}>
+              <thead><tr>
+                <th style={overviewHeadCell}>학번</th><th style={overviewHeadCell}>이름</th>
+                {round.subjects.map((s) => <th key={s} style={overviewHeadCell}>{s}</th>)}
+                <th style={overviewHeadCell}>한 과목 목표</th>
+                <th style={overviewHeadCell}>목표점수 초기화</th>
+              </tr></thead>
+              <tbody>
+                {studentRows.map((r) => {
+                  const fullSet = !!r.full?.setAt;
+                  const singleSet = !!r.single?.setAt;
+                  const busyFull = !!resetBusy[`${r.id}:${roundKey}:full`];
+                  const busySingle = !!resetBusy[`${r.id}:${roundKey}:single`];
+                  return (
+                    <tr key={r.id}>
+                      <td style={overviewCell}>{r.id}</td>
+                      <td style={{ ...overviewCell, fontWeight: 700 }}>{r.name}</td>
+                      {round.subjects.map((s) => <td key={s} style={overviewCell}>{toScore(r.full?.[s]) != null ? `${toScore(r.full[s])}점` : "-"}</td>)}
+                      <td style={overviewCell}>{singleSet ? `${r.single.subject} ${r.single.score}점` : "-"}</td>
+                      <td style={overviewCell}>
+                        <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
+                          {fullSet && (
+                            <button style={{ ...ghostBtnStyle, height: 28, padding: "0 8px", fontSize: 11 }} disabled={busyFull} onClick={() => resetOne(r.id, "full")}>
+                              {busyFull ? "초기화 중" : `${roundKey === "2-1" ? "1차" : "2차"} 7과목`}
+                            </button>
+                          )}
+                          {singleSet && (
+                            <button style={{ ...ghostBtnStyle, height: 28, padding: "0 8px", fontSize: 11 }} disabled={busySingle} onClick={() => resetOne(r.id, "single")}>
+                              {busySingle ? "초기화 중" : `${roundKey === "2-1" ? "1차" : "2차"} 한과목`}
+                            </button>
+                          )}
+                          {!fullSet && !singleSet && <span style={{ fontSize: 11, color: "var(--ink-soft)" }}>설정된 목표 없음</span>}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <p style={{ fontSize: 11, color: "var(--ink-soft)", margin: "10px 0 0" }}>
+            표시 대상: 10801~10831. 10800은 이 점수표에 표시하지 않아. 초기화는 선택한 시험 회차의 목표만 지워.
+          </p>
+        </SectionCard>
       </div>
-    </SectionCard>
+      <style>{`@media (max-width: 900px){.goal-admin-split{grid-template-columns:1fr !important;}}`}</style>
+    </div>
   );
 }
 
