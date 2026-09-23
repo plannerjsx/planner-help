@@ -32,6 +32,17 @@
   const SHARED_COLLECTION = "examPlannerShared";
   const LOCAL_PREFIX = "examPlannerStorage:personal:";
 
+  // 10816 전용 Firebase 사용량 화면에서 사용할 세션별 요청 통계
+  window.firebaseUsage = window.firebaseUsage || { reads: 0, writes: 0, deletes: 0, bytes: 0, startedAt: Date.now() };
+  function usageAdd(type, bytes) {
+    try {
+      if (type === "read") window.firebaseUsage.reads += 1;
+      if (type === "write") window.firebaseUsage.writes += 1;
+      if (type === "delete") window.firebaseUsage.deletes += 1;
+      if (bytes) window.firebaseUsage.bytes += Number(bytes) || 0;
+    } catch (e) {}
+  }
+
   // fetch에 타임아웃을 걸되, AbortController로 요청 자체를 취소해서 좀비 요청이 안 남게 함.
   async function fetchWithTimeout(url, options = {}, ms = 8000) {
     const controller = new AbortController();
@@ -84,6 +95,7 @@
         if (res.status === 404) return null;
         if (!res.ok) throw new Error("HTTP " + res.status);
         const data = await res.json();
+        usageAdd("read", JSON.stringify(data).length);
         const decoded = decodeFields(data.fields);
         return { key, value: decoded.value, shared: true };
       } catch (e) {
@@ -111,6 +123,7 @@
           }
         );
         if (!res.ok) throw new Error("HTTP " + res.status);
+        usageAdd("write", JSON.stringify(body).length);
         return { key, value, shared: true };
       } catch (e) {
         console.error("storage.set 실패", key, e);
@@ -132,6 +145,7 @@
           { method: "DELETE" }
         );
         if (!res.ok && res.status !== 404) throw new Error("HTTP " + res.status);
+        usageAdd("delete");
         return { key, deleted: true, shared: true };
       } catch (e) {
         console.error("storage.delete 실패", key, e);
@@ -164,6 +178,7 @@
           const res = await fetchWithTimeout(url);
           if (!res.ok) throw new Error("HTTP " + res.status);
           const data = await res.json();
+          usageAdd("read", JSON.stringify(data).length);
           (data.documents || []).forEach((d) => {
             const id = d.name.split("/").pop();
             if (!prefix || id.startsWith(prefix)) keys.push(id);
@@ -230,7 +245,7 @@ const PLANNER_TABS = [
   ["daily", "데일리"],
   ["monthly", "먼슬리"],
   ["notes", "메모"],
-  ["grades", "성적통계"],
+  ["grades", "시험목표"],
   ["scope", "시험범위"],
   ["board", "게시판"],
 ];
@@ -306,6 +321,14 @@ const EXAM_ROUNDS = [
   { key: "2-2", label: "2학기 2차", subjects: ["국어", "기가", "수학", "사회", "과학", "영어", "한국사"] },
 ];
 const DEFAULT_ROUND_KEY = "2-1";
+
+// 시험목표는 2학기 1차/2차만 사용하고, 과목은 기존 7과목을 그대로 사용
+const GOAL_ROUNDS = EXAM_ROUNDS.filter((r) => r.key === "2-1" || r.key === "2-2");
+const DEFAULT_GOAL_PERIODS = {
+  "2-1": { start: "", end: "" },
+  "2-2": { start: "", end: "" },
+};
+
 
 // 시험 시간표 - 시험범위와 같은 1차/2차 구분, 4일 × 교시별 과목(직접 입력)
 const EXAM_TIMETABLE_DAYS = ["1일차", "2일차", "3일차", "4일차"];
@@ -454,7 +477,7 @@ function ExamPlanner() {
     setResetBusy(true);
     setResetMsg("");
     try {
-      const prefixes = ["tasks:", "subjects:", "timetable:", "scores:", "quotePick:"];
+      const prefixes = ["tasks:", "subjects:", "timetable:", "scores:", "goalScores:", "quotePick:"];
       for (const prefix of prefixes) {
         const listed = await window.storage.list(prefix, true);
         const keys = listed && listed.keys ? listed.keys : [];
@@ -518,6 +541,10 @@ function ExamPlanner() {
   const [timetable, setTimetable] = useLocalState(`timetable:${dataOwner}`, {}, true);
   const [tasks, setTasks] = useLocalState(`tasks:${dataOwner}`, {}, true);
   const [scores, setScores] = useLocalState(`scores:${dataOwner}`, {}, true);
+  // 시험목표: 학번별·회차별 목표점수. setAt으로 설정일을 기록해 통계 공개 시점을 제어한다.
+  const [goalScores, setGoalScores] = useLocalState(`goalScores:${dataOwner}`, {}, true);
+  const [singleGoalScores, setSingleGoalScores] = useLocalState(`singleGoalScores:${dataOwner}`, {}, true);
+  const [goalPeriods, setGoalPeriods] = useLocalState("goalPeriods", DEFAULT_GOAL_PERIODS, true);
   const [notes, setNotes] = useLocalState(`notes:${dataOwner}`, [], true);
 
   // 시험범위 - 반 전체 공유, 지정된 학번만 수정 가능
@@ -567,6 +594,43 @@ function ExamPlanner() {
   useEffect(() => {
     if (canSeeGrades) loadClassScores();
   }, [canSeeGrades, loadClassScores]);
+
+  // 10816은 개인 목표점수를 볼 수 없고, 통계에 필요한 익명 집계값만 읽는다.
+  const [classGoals, setClassGoals] = useState({});
+  const [classSingleGoals, setClassSingleGoals] = useState({});
+  const [goalsLoading, setGoalsLoading] = useState(false);
+  const loadClassGoals = useCallback(async () => {
+    setGoalsLoading(true);
+    try {
+      const listed = await window.storage.list("goalScores:", true);
+      const keys = listed && listed.keys ? listed.keys : [];
+      const entries = {};
+      for (const k of keys) {
+        try {
+          const r = await window.storage.get(k, true);
+          if (r) entries[k.slice("goalScores:".length)] = JSON.parse(r.value);
+        } catch (e) {}
+      }
+      setClassGoals(entries);
+      const singleListed = await window.storage.list("singleGoalScores:", true);
+      const singleEntries = {};
+      for (const k of (singleListed?.keys || [])) {
+        try {
+          const r = await window.storage.get(k, true);
+          if (r) singleEntries[k.slice("singleGoalScores:".length)] = JSON.parse(r.value);
+        } catch (e) {}
+      }
+      setClassSingleGoals(singleEntries);
+    } catch (e) {
+      setClassGoals({});
+      setClassSingleGoals({});
+    }
+    setGoalsLoading(false);
+  }, []);
+
+  useEffect(() => {
+    if (STATS_ACCESS_IDS.has(profile.studentId)) loadClassGoals();
+  }, [profile.studentId, loadClassGoals]);
 
   const [accounts, setAccounts] = useState({});
   const [accountsLoading, setAccountsLoading] = useState(false);
@@ -942,6 +1006,10 @@ function ExamPlanner() {
             allTasks={allTasks}
             tasksLoading={tasksLoading}
             reloadTasks={loadAllTasks}
+            goalScores={classGoals}
+            singleGoalScores={classSingleGoals}
+            goalPeriods={goalPeriods}
+            setGoalPeriods={setGoalPeriods}
             quotes={quotes}
             onAddQuote={addQuote}
             onRemoveQuote={removeQuote}
@@ -973,9 +1041,12 @@ function ExamPlanner() {
             accountsLoading={accountsLoading}
             accountsLoadError={accountsLoadError}
             reloadAccounts={loadAccounts}
-            classScores={classScores}
-            statsLoading={statsLoading}
-            reloadStats={loadClassScores}
+            classGoals={classGoals}
+            classSingleGoals={classSingleGoals}
+            goalsLoading={goalsLoading}
+            reloadGoals={loadClassGoals}
+            goalPeriods={goalPeriods}
+            setGoalPeriods={setGoalPeriods}
             allTasks={allTasks}
             tasksLoading={tasksLoading}
             reloadTasks={loadAllTasks}
@@ -1076,7 +1147,14 @@ function ExamPlanner() {
           <NotesTab notes={notes} setNotes={setNotes} />
         )}
         {tab === "grades" && (
-          <GradesTab scores={scores} setScores={setScores} />
+          <ExamGoalTab
+            goalScores={goalScores}
+            setGoalScores={setGoalScores}
+            singleGoalScores={singleGoalScores}
+            setSingleGoalScores={setSingleGoalScores}
+            goalPeriods={goalPeriods}
+            studentId={profile.studentId}
+          />
         )}
         {tab === "scope" && (
           <ExamScopeTab
@@ -2155,116 +2233,241 @@ function NotesTab({ notes, setNotes }) {
   );
 }
 
-function GradesTab({ scores, setScores }) {
-  const [roundKey, setRoundKey] = useState(DEFAULT_ROUND_KEY);
-  const [draft, setDraft] = useState({}); // { subject: { actual, target } }
-  const [saved, setSaved] = useState(false);
-  const round = EXAM_ROUNDS.find((r) => r.key === roundKey);
-  const roundScores = scores[roundKey] || {};
+function isGoalPeriodOpen(period) {
+  if (!period || !period.start || !period.end) return false;
+  const today = toKey(new Date());
+  return today >= period.start && today <= period.end;
+}
+
+function isAfterSetDay(setAt) {
+  if (!setAt) return false;
+  const d = new Date(setAt);
+  const next = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1);
+  const today = new Date();
+  return today >= new Date(next.getFullYear(), next.getMonth(), next.getDate());
+}
+
+function ExamGoalTab({ goalScores, setGoalScores, singleGoalScores, setSingleGoalScores, goalPeriods, studentId }) {
+  const [roundKey, setRoundKey] = useState("2-1");
+  const [draft, setDraft] = useState({});
+  const [msg, setMsg] = useState("");
+  const round = GOAL_ROUNDS.find((r) => r.key === roundKey) || GOAL_ROUNDS[0];
+  const current = goalScores[roundKey];
+  const period = goalPeriods[roundKey] || {};
+  const locked = !!current?.setAt;
+  const open = isGoalPeriodOpen(period);
+  const revealed = locked && isAfterSetDay(current.setAt);
+  const singleCurrent = singleGoalScores?.[roundKey];
+  const [singleSubject, setSingleSubject] = useState(round.subjects[0]);
+  const [singleDraft, setSingleDraft] = useState("");
+  const [singleMsg, setSingleMsg] = useState("");
+  const singleLocked = !!singleCurrent?.setAt;
+
+  useEffect(() => {
+    const savedSubject = singleCurrent?.subject;
+    setSingleSubject(savedSubject && round.subjects.includes(savedSubject) ? savedSubject : round.subjects[0]);
+    setSingleDraft(singleCurrent?.score ?? "");
+    setSingleMsg("");
+  }, [roundKey, singleGoalScores]);
+
+  const saveSingleTarget = async () => {
+    if (singleLocked || !open) return;
+    const n = Number(singleDraft);
+    if (!singleSubject) { setSingleMsg("과목을 선택해줘."); return; }
+    if (!Number.isFinite(n) || n < 0 || n > 100) { setSingleMsg("목표점수는 0~100 사이로 입력해줘."); return; }
+    const next = { ...singleGoalScores, [roundKey]: { subject: singleSubject, score: n, setAt: Date.now() } };
+    const ok = await setSingleGoalScores(next);
+    if (ok === false) { setSingleMsg("저장에 실패했어. 다시 시도해줘."); return; }
+    setSingleMsg("한 과목 목표점수가 저장됐어. 이제 수정할 수 없어.");
+  };
 
   useEffect(() => {
     const next = {};
-    round.subjects.forEach((s) => {
-      next[s] = {
-        actual: roundScores[s]?.actual ?? "",
-        target: roundScores[s]?.target ?? "",
-      };
-    });
+    round.subjects.forEach((s) => { next[s] = current?.[s] ?? ""; });
     setDraft(next);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roundKey, scores]);
+    setMsg("");
+  }, [roundKey, goalScores]);
 
-  const [saveError, setSaveError] = useState("");
-  const persist = async (nextDraft) => {
-    const cleanRound = {};
-    round.subjects.forEach((s) => {
-      const a = Number(nextDraft[s]?.actual);
-      const t = Number(nextDraft[s]?.target);
-      cleanRound[s] = {
-        ...(nextDraft[s]?.actual !== "" && !isNaN(a) ? { actual: a } : {}),
-        ...(nextDraft[s]?.target !== "" && !isNaN(t) ? { target: t } : {}),
-      };
-    });
-    const ok = await setScores({ ...scores, [roundKey]: cleanRound });
-    if (ok === false) {
-      setSaveError("저장에 실패했어. 다시 입력해줘.");
+  const saveTargets = async () => {
+    if (locked || !open) return;
+    const missing = round.subjects.filter((s) => draft[s] === "" || draft[s] == null);
+    if (missing.length) {
+      setMsg(`7과목을 모두 입력해줘. 아직 ${missing.length}과목이 남았어.`);
       return;
     }
-    setSaveError("");
-    setSaved(true);
-    setTimeout(() => setSaved(false), 900);
+    const invalid = round.subjects.some((s) => {
+      const n = Number(draft[s]);
+      return !Number.isFinite(n) || n < 0 || n > 100;
+    });
+    if (invalid) {
+      setMsg("목표점수는 0~100 사이로 입력해줘.");
+      return;
+    }
+    const clean = { setAt: Date.now() };
+    round.subjects.forEach((s) => { clean[s] = Number(draft[s]); });
+    const ok = await setGoalScores({ ...goalScores, [roundKey]: clean });
+    if (ok === false) {
+      setMsg("저장에 실패했어. 다시 시도해줘.");
+      return;
+    }
+    setMsg("목표점수가 저장됐어. 이제 수정할 수 없어.");
   };
-
-  const setField = (subj, field, value) => {
-    const next = { ...draft, [subj]: { ...draft[subj], [field]: value } };
-    setDraft(next);
-    persist(next);
-  };
-
-  const chartData = round.subjects.map((s) => ({
-    subject: s,
-    내점수: Number(draft[s]?.actual) || 0,
-    목표: Number(draft[s]?.target) || 0,
-  }));
 
   return (
     <div>
       <nav style={{ ...tabBarStyle, marginBottom: 14 }}>
-        {EXAM_ROUNDS.map((r) => (
-          <button key={r.key} onClick={() => setRoundKey(r.key)} style={{ ...tabBtnStyle, ...(roundKey === r.key ? tabBtnActiveStyle : {}) }}>
+        {GOAL_ROUNDS.map((r) => (
+          <button key={r.key} onClick={() => setRoundKey(r.key)}
+            style={{ ...tabBtnStyle, ...(roundKey === r.key ? tabBtnActiveStyle : {}) }}>
             {r.label}
           </button>
         ))}
       </nav>
 
-      <SectionCard title={`${round.label} 성적 입력`} subtitle="입력하면 바로 저장돼 · 내 점수는 나만 볼 수 있어">
-        {round.subjects.map((s) => {
-          const a = draft[s]?.actual;
-          const t = draft[s]?.target;
-          const diff = a !== "" && t !== "" && !isNaN(Number(a)) && !isNaN(Number(t)) ? Number(a) - Number(t) : null;
-          return (
-            <div key={s} style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8, flexWrap: "wrap" }}>
-              <span style={{ width: 56, fontSize: 13, color: "var(--ink)", fontWeight: 600 }}>{s}</span>
-              <input
-                type="number" min="0" max="100" placeholder="내 점수"
-                value={a ?? ""}
-                onChange={(e) => setField(s, "actual", e.target.value)}
-                style={{ ...inputStyle, width: 90, height: 32 }}
-              />
-              <input
-                type="number" min="0" max="100" placeholder="목표 점수"
-                value={t ?? ""}
-                onChange={(e) => setField(s, "target", e.target.value)}
-                style={{ ...inputStyle, width: 90, height: 32 }}
-              />
-              {diff != null && (
-                <span style={{ fontSize: 12, fontWeight: 700, color: diff >= 0 ? "var(--teal)" : "var(--coral)" }}>
-                  {diff >= 0 ? `목표 +${diff}` : `목표 ${diff}`}
-                </span>
-              )}
-            </div>
-          );
-        })}
-        <p style={{ fontSize: 12, color: saveError ? "var(--coral)" : saved ? "var(--teal)" : "var(--ink-soft)", margin: "10px 0 0", fontWeight: 600, transition: "color .3s" }}>
-          {saveError || (saved ? "저장됨" : "\u00A0")}
+      <SectionCard
+        title={`${round.label} 시험목표`}
+        subtitle={
+          !period.start || !period.end
+            ? "아직 관리자가 목표 설정 기간을 정하지 않았어."
+            : `${period.start} ~ ${period.end}`
+        }
+      >
+        {round.subjects.map((s) => (
+          <div key={s} style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 9, flexWrap: "wrap" }}>
+            <span style={{ width: 64, fontSize: 13, color: "var(--ink)", fontWeight: 700 }}>{s}</span>
+            <input
+              type="number" min="0" max="100" placeholder="목표 점수"
+              disabled={locked || !open}
+              value={draft[s] ?? ""}
+              onChange={(e) => setDraft({ ...draft, [s]: e.target.value })}
+              style={{ ...inputStyle, width: 110, height: 32, opacity: locked || !open ? 0.65 : 1 }}
+            />
+            {locked && <span style={{ fontSize: 11, color: "var(--ink-soft)" }}>설정 완료</span>}
+          </div>
+        ))}
+        {!locked && (
+          <button
+            style={{ ...primaryBtnStyle, marginTop: 5 }}
+            disabled={!open}
+            onClick={saveTargets}
+          >
+            7과목 목표점수 확정
+          </button>
+        )}
+        <p style={{ fontSize: 12, color: msg ? "var(--coral)" : "var(--ink-soft)", margin: "10px 0 0" }}>
+          {msg || (locked ? "목표점수는 한 번 확정하면 변경할 수 없어." :
+            !open ? "관리자가 정한 기간에만 목표점수를 설정할 수 있어." :
+            "7과목을 모두 입력한 뒤 확정해줘. 확정 후에는 수정할 수 없어.")}
         </p>
       </SectionCard>
 
-      <SectionCard title="내 점수 vs 목표 점수">
-        <div style={{ height: 220 }}>
-          <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={chartData} margin={{ top: 8, right: 8, left: -20, bottom: 0 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#D7DFEA" />
-              <XAxis dataKey="subject" tick={{ fontSize: 12, fill: "#55617A" }} />
-              <YAxis tick={{ fontSize: 12, fill: "#55617A" }} domain={[0, 100]} />
-              <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8, border: "1px solid #D7DFEA" }} />
-              <Bar dataKey="내점수" fill="#FFC145" radius={[4, 4, 0, 0]} />
-              <Bar dataKey="목표" fill="#1E8F76" radius={[4, 4, 0, 0]} />
-            </BarChart>
-          </ResponsiveContainer>
+      <SectionCard title="한 과목 목표점수" subtitle="7과목 목표와 별도로 딱 한 과목의 목표점수를 따로 설정할 수 있어.">
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <select
+            value={singleSubject}
+            disabled={singleLocked || !open}
+            onChange={(e) => setSingleSubject(e.target.value)}
+            style={{ ...inputStyle, width: 130, height: 34, opacity: singleLocked || !open ? 0.65 : 1 }}
+          >
+            {round.subjects.map((s) => <option key={s} value={s}>{s}</option>)}
+          </select>
+          <input
+            type="number" min="0" max="100" placeholder="목표 점수"
+            disabled={singleLocked || !open}
+            value={singleDraft}
+            onChange={(e) => setSingleDraft(e.target.value)}
+            style={{ ...inputStyle, width: 110, height: 34, opacity: singleLocked || !open ? 0.65 : 1 }}
+          />
+          {!singleLocked && <button style={primaryBtnStyle} disabled={!open} onClick={saveSingleTarget}>한 과목 목표 확정</button>}
+          {singleLocked && <span style={{ fontSize: 12, color: "var(--ink-soft)" }}>{singleCurrent.subject} {singleCurrent.score}점 · 설정 완료</span>}
         </div>
+        <p style={{ fontSize: 12, color: singleMsg ? "var(--coral)" : "var(--ink-soft)", margin: "10px 0 0" }}>
+          {singleMsg || (singleLocked ? "한 과목 목표는 한 번 확정하면 변경할 수 없어." : !open ? "관리자가 정한 기간에만 설정할 수 있어." : "7과목 목표와 독립적으로 설정돼.")}
+        </p>
       </SectionCard>
+
+      {revealed ? (
+        <GoalStatsForStudent round={round} myRound={current} studentId={studentId} />
+      ) : locked ? (
+        <SectionCard title="전체 통계표">
+          <EmptyHint text="목표를 설정한 다음날부터 전체 통계표가 표시돼." />
+        </SectionCard>
+      ) : null}
     </div>
+  );
+}
+
+function GoalStatsForStudent({ round, myRound }) {
+  const [allGoals, setAllGoals] = useState({});
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const listed = await window.storage.list("goalScores:", true);
+        const keys = listed?.keys || [];
+        const result = {};
+        for (const k of keys) {
+          try {
+            const r = await window.storage.get(k, true);
+            if (r) result[k.slice("goalScores:".length)] = JSON.parse(r.value);
+          } catch (e) {}
+        }
+        if (alive) setAllGoals(result);
+      } catch (e) {
+        if (alive) setAllGoals({});
+      } finally {
+        if (alive) setLoading(false);
+      }
+    })();
+    return () => { alive = false; };
+  }, [round.key]);
+
+  if (loading) return <SectionCard title="전체 통계표"><p style={{ fontSize: 13 }}>통계를 불러오는 중...</p></SectionCard>;
+
+  const rows = round.subjects.map((subject) => {
+    const values = Object.values(allGoals)
+      .filter((g) => isAfterSetDay(g?.setAt))
+      .map((g) => g?.[round.key]?.[subject])
+      .filter((v) => typeof v === "number");
+    const mine = typeof myRound?.[subject] === "number" ? myRound[subject] : null;
+    const sorted = [...values].sort((a, b) => b - a);
+    const rank = mine == null ? null : sorted.findIndex((v) => v === mine) + 1;
+    const avg = values.length ? Math.round(values.reduce((a,b) => a+b,0) / values.length * 10) / 10 : null;
+    return { subject, mine, avg, count: values.length, rank };
+  });
+
+  return (
+    <SectionCard title="전체 통계표" subtitle="목표를 설정한 다음날부터 집계된 익명 통계">
+      <div style={{ overflowX: "auto" }}>
+        <table style={overviewTableStyle}>
+          <thead>
+            <tr>
+              <th style={overviewHeadCell}>과목</th>
+              <th style={overviewHeadCell}>내 목표</th>
+              <th style={overviewHeadCell}>전체 평균</th>
+              <th style={overviewHeadCell}>참여자</th>
+              <th style={overviewHeadCell}>내 위치</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.subject}>
+                <td style={{ ...overviewCell, fontWeight: 700 }}>{r.subject}</td>
+                <td style={overviewCell}>{r.mine == null ? "-" : `${r.mine}점`}</td>
+                <td style={overviewCell}>{r.avg == null ? "-" : `${r.avg}점`}</td>
+                <td style={overviewCell}>{r.count}명</td>
+                <td style={overviewCell}>{r.rank == null ? "-" : `${r.rank}위 / ${r.count}명`}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p style={{ fontSize: 11, color: "var(--ink-soft)", margin: "10px 0 0" }}>
+        순위는 공개된 목표점수만을 기준으로 계산하며, 학생 이름과 학번은 통계표에 표시하지 않아.
+      </p>
+    </SectionCard>
   );
 }
 
@@ -2590,7 +2793,7 @@ function MyPageTab({ profile, subjects, exam, onLogout, canOpenAdminView, onOpen
       </SectionCard>
 
       {canOpenAdminView && (
-        <SectionCard title="관리 페이지" subtitle="부관리자 권한 · 학생 정보/통계/활동 열람">
+        <SectionCard title="관리 페이지" subtitle="10816 관리자 권한 · 학생 정보/통계/활동/시험목표 관리">
           <button style={{ ...primaryBtnStyle, width: "100%" }} onClick={onOpenAdminView}>
             관리 페이지 열기
           </button>
@@ -2606,8 +2809,8 @@ function MyPageTab({ profile, subjects, exam, onLogout, canOpenAdminView, onOpen
   );
 }
 
-function AdminPanel({ accounts, setAccounts, accountsLoading, accountsLoadError, reloadAccounts, allTasks, tasksLoading, reloadTasks, quotes, onAddQuote, onRemoveQuote }) {
-  const [innerTab, setInnerTab] = useState("accounts"); // accounts | activity | quotes
+function AdminPanel({ accounts, setAccounts, accountsLoading, accountsLoadError, reloadAccounts, allTasks, tasksLoading, reloadTasks, goalScores, singleGoalScores, goalPeriods, setGoalPeriods, quotes, onAddQuote, onRemoveQuote }) {
+  const [innerTab, setInnerTab] = useState("accounts"); // accounts | goals | activity | quotes
   const [rowBusy, setRowBusy] = useState({});
   const [rowMsg, setRowMsg] = useState({});
   const [confirmingDelete, setConfirmingDelete] = useState(null);
@@ -2641,8 +2844,17 @@ function AdminPanel({ accounts, setAccounts, accountsLoading, accountsLoadError,
         <button onClick={() => setInnerTab("accounts")} style={{ ...tabBtnStyle, ...(innerTab === "accounts" ? tabBtnActiveStyle : {}) }}>
           계정 관리
         </button>
+        <button onClick={() => setInnerTab("goals")} style={{ ...tabBtnStyle, ...(innerTab === "goals" ? tabBtnActiveStyle : {}) }}>
+          시험목표 관리
+        </button>
         <button onClick={() => setInnerTab("activity")} style={{ ...tabBtnStyle, ...(innerTab === "activity" ? tabBtnActiveStyle : {}) }}>
           활동 로그
+        </button>
+        <button onClick={() => setInnerTab("goalmanage")} style={{ ...tabBtnStyle, ...(innerTab === "goalmanage" ? tabBtnActiveStyle : {}) }}>
+          시험목표 관리
+        </button>
+        <button onClick={() => setInnerTab("firebase")} style={{ ...tabBtnStyle, ...(innerTab === "firebase" ? tabBtnActiveStyle : {}) }}>
+          Firebase 사용량
         </button>
         <button onClick={() => setInnerTab("quotes")} style={{ ...tabBtnStyle, ...(innerTab === "quotes" ? tabBtnActiveStyle : {}) }}>
           명언 관리
@@ -2708,6 +2920,16 @@ function AdminPanel({ accounts, setAccounts, accountsLoading, accountsLoadError,
         </SectionCard>
       )}
 
+      {innerTab === "goals" && (
+        <GoalAdminPanel
+          students={students}
+          goalScores={goalScores}
+          singleGoalScores={singleGoalScores}
+          goalPeriods={goalPeriods}
+          setGoalPeriods={setGoalPeriods}
+        />
+      )}
+
       {innerTab === "activity" && (
         <ActivityLogPanel
           students={students}
@@ -2716,13 +2938,195 @@ function AdminPanel({ accounts, setAccounts, accountsLoading, accountsLoadError,
           onReload={reloadTasks}
         />
       )}
+      {innerTab === "goalmanage" && (
+        <GoalAdminPanel
+          students={students}
+          goalScores={classGoals}
+          singleGoalScores={classSingleGoals}
+          goalPeriods={goalPeriods}
+          setGoalPeriods={setGoalPeriods}
+        />
+      )}
+      {innerTab === "firebase" && <FirebaseUsagePanel />}
+    </div>
+  );
+}
+
+function GoalAdminPanel({ students, goalScores, singleGoalScores, goalPeriods, setGoalPeriods }) {
+  const [draft, setDraft] = useState(goalPeriods || DEFAULT_GOAL_PERIODS);
+  const [msg, setMsg] = useState("");
+
+  useEffect(() => setDraft(goalPeriods || DEFAULT_GOAL_PERIODS), [goalPeriods]);
+
+  const savePeriod = async (roundKey) => {
+    const p = draft[roundKey] || {};
+    if (!p.start || !p.end || p.start > p.end) {
+      setMsg("시작일과 종료일을 올바르게 입력해줘.");
+      return;
+    }
+    await setGoalPeriods({ ...draft, [roundKey]: p });
+    setMsg(`${roundKey === "2-1" ? "2학기 1차" : "2학기 2차"} 목표 설정 기간을 저장했어.`);
+  };
+
+  const resetStudentGoal = async (sid, roundKey) => {
+    const current = goalScores?.[sid] || {};
+    const next = { ...current };
+    delete next[roundKey];
+    await window.storage.set(`goalScores:${sid}`, JSON.stringify(next), true);
+    setMsg(`${sid}의 ${roundKey === "2-1" ? "2학기 1차" : "2학기 2차"} 목표를 초기화했어.`);
+    window.location.reload();
+  };
+  const resetStudentSingleGoal = async (sid, roundKey) => {
+    const current = singleGoalScores?.[sid] || {};
+    const next = { ...current };
+    delete next[roundKey];
+    await window.storage.set(`singleGoalScores:${sid}`, JSON.stringify(next), true);
+    setMsg(`${sid}의 ${roundKey === "2-1" ? "2학기 1차" : "2학기 2차"} 한 과목 목표를 초기화했어.`);
+    window.location.reload();
+  };
+
+  return (
+    <div>
+      <SectionCard title="시험목표 기간 설정" subtitle="관리자가 설정한 기간 안에서만 학생이 목표점수를 입력할 수 있어.">
+        {GOAL_ROUNDS.map((r) => {
+          const p = draft[r.key] || {};
+          return (
+            <div key={r.key} style={{ ...adminRowStyle, marginBottom: 10 }}>
+              <div style={{ fontWeight: 700, marginBottom: 8 }}>{r.label}</div>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                <input type="date" value={p.start || ""} onChange={(e) => setDraft({ ...draft, [r.key]: { ...p, start: e.target.value } })} style={{ ...inputStyle, width: 150, height: 34 }} />
+                <span>~</span>
+                <input type="date" value={p.end || ""} onChange={(e) => setDraft({ ...draft, [r.key]: { ...p, end: e.target.value } })} style={{ ...inputStyle, width: 150, height: 34 }} />
+                <button style={ghostBtnStyle} onClick={() => savePeriod(r.key)}>기간 저장</button>
+              </div>
+            </div>
+          );
+        })}
+        {msg && <p style={{ fontSize: 12, color: "var(--teal)", margin: "8px 0 0" }}>{msg}</p>}
+      </SectionCard>
+
+      <SectionCard title="학생별 목표 초기화" subtitle="초기화하면 해당 학생이 다시 목표를 설정할 수 있어.">
+        {students.map(([id, name]) => {
+          const has1 = !!goalScores?.[id]?.["2-1"]?.setAt;
+          const has2 = !!goalScores?.[id]?.["2-2"]?.setAt;
+          return (
+            <div key={id} style={adminRowStyle}>
+              <div style={{ marginBottom: 8 }}>
+                <span style={{ fontWeight: 700 }}>{name}</span>
+                <span style={{ fontSize: 12, color: "var(--ink-soft)", marginLeft: 8 }}>{id}</span>
+              </div>
+              {has1 && (
+                <div style={{ fontSize: 12, color: "var(--ink-soft)", marginBottom: 7 }}>
+                  1차: {GOAL_ROUNDS[0].subjects.map((s) => `${s} ${goalScores[id]["2-1"][s] ?? "-"}점`).join(" · ")}
+                </div>
+              )}
+              {has2 && (
+                <div style={{ fontSize: 12, color: "var(--ink-soft)", marginBottom: 7 }}>
+                  2차: {GOAL_ROUNDS[1].subjects.map((s) => `${s} ${goalScores[id]["2-2"][s] ?? "-"}점`).join(" · ")}
+                </div>
+              )}
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                <button style={{ ...ghostBtnStyle, height: 32 }} disabled={!has1} onClick={() => resetStudentGoal(id, "2-1")}>1차 초기화</button>
+                <button style={{ ...ghostBtnStyle, height: 32 }} disabled={!has2} onClick={() => resetStudentGoal(id, "2-2")}>2차 초기화</button>
+                <button style={{ ...ghostBtnStyle, height: 32 }} disabled={!singleGoalScores?.[id]?.["2-1"]?.setAt} onClick={() => resetStudentSingleGoal(id, "2-1")}>1차 한 과목 초기화</button>
+                <button style={{ ...ghostBtnStyle, height: 32 }} disabled={!singleGoalScores?.[id]?.["2-2"]?.setAt} onClick={() => resetStudentSingleGoal(id, "2-2")}>2차 한 과목 초기화</button>
+              </div>
+              {(singleGoalScores?.[id]?.["2-1"]?.setAt || singleGoalScores?.[id]?.["2-2"]?.setAt) && (
+                <div style={{ fontSize: 12, color: "var(--ink-soft)", marginTop: 7 }}>
+                  한 과목 목표: {["2-1","2-2"].map((rk) => {
+                    const g = singleGoalScores?.[id]?.[rk];
+                    return g?.setAt ? `${rk === "2-1" ? "1차" : "2차"} ${g.subject} ${g.score}점` : null;
+                  }).filter(Boolean).join(" · ")}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </SectionCard>
+    </div>
+  );
+}
+
+function formatBytes(bytes) {
+  const n = Number(bytes) || 0;
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function FirebaseUsagePanel() {
+  const [loading, setLoading] = useState(false);
+  const [data, setData] = useState({ docs: 0, bytes: 0, byPrefix: [] });
+  const [session, setSession] = useState(() => ({ ...(window.firebaseUsage || {}) }));
+
+  const refresh = async () => {
+    setLoading(true);
+    try {
+      const listed = await window.storage.list("", true);
+      const keys = listed?.keys || [];
+      let bytes = 0;
+      const groups = {};
+      for (const k of keys) {
+        try {
+          const r = await window.storage.get(k, true);
+          const raw = r?.value ?? "";
+          const size = new Blob([String(raw)]).size;
+          bytes += size;
+          const prefix = k.includes(":") ? k.split(":")[0] + ":" : "(기타)";
+          groups[prefix] = (groups[prefix] || 0) + size;
+        } catch (e) {}
+      }
+      const byPrefix = Object.entries(groups).sort((a,b) => b[1] - a[1]).map(([prefix,size]) => ({ prefix, size }));
+      setData({ docs: keys.length, bytes, byPrefix });
+      setSession({ ...(window.firebaseUsage || {}) });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { refresh(); }, []);
+
+  useEffect(() => {
+    const id = setInterval(() => setSession({ ...(window.firebaseUsage || {}) }), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  return (
+    <div>
+      <SectionCard title="Firebase 사용량" subtitle="10816 전용 · 현재 Firestore에 저장된 데이터의 대략적인 크기와 이 브라우저 세션의 요청량을 보여줘.">
+        <div className="grid-row-mobile" style={gridRow}>
+          <MetricCard label="저장 문서" value={`${data.docs}개`} accent="var(--ink)" />
+          <MetricCard label="저장 데이터(대략)" value={formatBytes(data.bytes)} accent="var(--teal)" />
+          <MetricCard label="세션 읽기" value={`${session.reads || 0}회`} accent="var(--ink)" />
+          <MetricCard label="세션 쓰기" value={`${session.writes || 0}회`} accent="var(--ink)" />
+          <MetricCard label="세션 삭제" value={`${session.deletes || 0}회`} accent="var(--coral)" />
+          <MetricCard label="세션 응답량" value={formatBytes(session.bytes || 0)} accent="var(--ink)" />
+        </div>
+        <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+          <button style={ghostBtnStyle} onClick={refresh} disabled={loading}>{loading ? "계산 중..." : "사용량 새로고침"}</button>
+        </div>
+        <p style={{ fontSize: 12, color: "var(--ink-soft)", margin: "0 0 12px" }}>
+          주의: 이 화면의 저장 데이터 크기는 Firestore 문서 내용을 기준으로 계산한 대략값이야. Firebase 콘솔의 과금·할당량 수치와는 다를 수 있어.
+        </p>
+        <div style={{ overflowX: "auto" }}>
+          <table style={overviewTableStyle}>
+            <thead><tr><th style={overviewHeadCell}>데이터 종류</th><th style={overviewHeadCell}>대략 크기</th></tr></thead>
+            <tbody>
+              {data.byPrefix.map(([prefix, size]) => (
+                <tr key={prefix}><td style={{ ...overviewCell, fontWeight: 700 }}>{prefix}</td><td style={overviewCell}>{formatBytes(size)}</td></tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </SectionCard>
     </div>
   );
 }
 
 function ViewerPanel({
   accounts, setAccounts, accountsLoading, accountsLoadError, reloadAccounts,
-  classScores, statsLoading, reloadStats, allTasks, tasksLoading, reloadTasks,
+  classGoals, classSingleGoals, goalsLoading, reloadGoals, goalPeriods, setGoalPeriods, allTasks, tasksLoading, reloadTasks,
   quotes, onAddQuote, onRemoveQuote,
   serverLock, serverLockLoaded, onToggleServerLock, onResetAllData, resetBusy, resetMsg,
   onResetDaily, resetDailyBusy, resetDailyMsg, onResetBoard, resetBoardBusy, resetBoardMsg,
@@ -2736,7 +3140,7 @@ function ViewerPanel({
       <div className="grid-row-mobile" style={gridRow}>
         <MetricCard label="전체 학생" value={`${students.length}명`} accent="var(--ink)" />
         <MetricCard label="등록 완료" value={`${registeredCount}명`} accent="var(--teal)" />
-        <MetricCard label="성적 제출" value={`${Object.keys(classScores).length}명`} accent="var(--ink)" />
+        <MetricCard label="목표 설정" value={`${Object.keys(classGoals || {}).length}명`} accent="var(--ink)" />
       </div>
       {accountsLoadError && <p style={errorTextStyle}>{accountsLoadError}</p>}
       <p style={{ fontSize: 12, color: "var(--ink-soft)", margin: "0 0 12px" }}>
@@ -2787,13 +3191,14 @@ function ViewerPanel({
       )}
 
       {innerTab === "stats" && (
-        <GradeOverviewPanel
+        <GoalOverviewPanel
           students={students}
           accounts={accounts}
           accountsLoading={accountsLoading}
-          classScores={classScores}
-          statsLoading={statsLoading}
-          onReload={() => { reloadAccounts(); reloadStats(); }}
+          classGoals={classGoals}
+          goalsLoading={goalsLoading}
+          goalPeriods={goalPeriods}
+          onReload={() => { reloadAccounts(); reloadGoals(); }}
         />
       )}
       {innerTab === "activity" && (
@@ -3151,134 +3556,57 @@ function ActivityLogPanel({ students, allTasks, tasksLoading, onReload }) {
   );
 }
 
-function GradeOverviewPanel({ students, accounts, accountsLoading, classScores, statsLoading, onReload }) {
-  const [roundKey, setRoundKey] = useState(DEFAULT_ROUND_KEY);
-  const [selectedId, setSelectedId] = useState(""); // "" = 전체 보기
-  const round = EXAM_ROUNDS.find((r) => r.key === roundKey);
+function GoalOverviewPanel({ students, accounts, accountsLoading, classGoals, goalsLoading, goalPeriods, onReload }) {
+  const [roundKey, setRoundKey] = useState("2-1");
+  const round = GOAL_ROUNDS.find((r) => r.key === roundKey) || GOAL_ROUNDS[0];
 
-  const avgBySubject = round.subjects.map((subj) => {
-    const values = students
-      .map(([id]) => classScores[id]?.[roundKey]?.[subj]?.actual)
+  const rows = round.subjects.map((subject) => {
+    const values = Object.values(classGoals || {})
+      .filter((g) => isAfterSetDay(g?.setAt))
+      .map((g) => g?.[roundKey]?.[subject])
       .filter((v) => typeof v === "number");
-    return values.length ? Math.round(values.reduce((a, b) => a + b, 0) / values.length) : null;
+    const avg = values.length ? Math.round(values.reduce((a,b) => a+b,0) / values.length * 10) / 10 : null;
+    const max = values.length ? Math.max(...values) : null;
+    const min = values.length ? Math.min(...values) : null;
+    return { subject, avg, max, min, count: values.length };
   });
 
-  const selected = students.find(([id]) => id === selectedId);
-  const selectedName = selected ? selected[1] : "";
-
   return (
-    <SectionCard
-      title="학생 정보 · 성적통계표"
-      subtitle={accountsLoading || statsLoading ? "불러오는 중..." : "10816 전용 · 학생별 입력값 기준"}
-    >
-      <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap", alignItems: "center" }}>
-        <button style={{ ...ghostBtnStyle }} onClick={onReload} disabled={accountsLoading || statsLoading}>새로고침</button>
-        <select value={selectedId} onChange={(e) => setSelectedId(e.target.value)} style={{ ...inputStyle, width: 180, height: 34 }}>
-          <option value="">전체 학생 보기</option>
-          {students.map(([id, name]) => (
-            <option key={id} value={id}>{name} ({id})</option>
-          ))}
-        </select>
-      </div>
-
-      <nav style={{ ...tabBarStyle, marginBottom: 14 }}>
-        {EXAM_ROUNDS.map((r) => (
+    <SectionCard title="전체 목표 통계표" subtitle={accountsLoading || goalsLoading ? "불러오는 중..." : "개인별 목표점수는 표시하지 않고 익명 집계만 제공"}>
+      <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
+        <button style={ghostBtnStyle} onClick={onReload} disabled={accountsLoading || goalsLoading}>새로고침</button>
+        {GOAL_ROUNDS.map((r) => (
           <button key={r.key} onClick={() => setRoundKey(r.key)} style={{ ...tabBtnStyle, ...(roundKey === r.key ? tabBtnActiveStyle : {}) }}>
             {r.label}
           </button>
         ))}
-      </nav>
-
-      {!selectedId ? (
-        <div style={{ overflowX: "auto" }}>
-          <table style={overviewTableStyle}>
-            <thead>
-              <tr>
-                <th style={overviewHeadCell}>학번</th>
-                <th style={overviewHeadCell}>이름</th>
-                <th style={overviewHeadCell}>등록</th>
-                {round.subjects.map((s) => (
-                  <th key={s} style={overviewHeadCell}>{s}</th>
-                ))}
+      </div>
+      <p style={{ fontSize: 12, color: "var(--ink-soft)", margin: "0 0 10px" }}>
+        공개 기준: 학생이 목표를 설정한 다음날부터 통계에 포함돼.
+      </p>
+      <div style={{ overflowX: "auto" }}>
+        <table style={overviewTableStyle}>
+          <thead><tr>
+            <th style={overviewHeadCell}>과목</th>
+            <th style={overviewHeadCell}>평균 목표</th>
+            <th style={overviewHeadCell}>최고 목표</th>
+            <th style={overviewHeadCell}>최저 목표</th>
+            <th style={overviewHeadCell}>참여자</th>
+          </tr></thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.subject}>
+                <td style={{ ...overviewCell, fontWeight: 700 }}>{r.subject}</td>
+                <td style={overviewCell}>{r.avg == null ? "-" : `${r.avg}점`}</td>
+                <td style={overviewCell}>{r.max == null ? "-" : `${r.max}점`}</td>
+                <td style={overviewCell}>{r.min == null ? "-" : `${r.min}점`}</td>
+                <td style={overviewCell}>{r.count}명</td>
               </tr>
-            </thead>
-            <tbody>
-              {students.map(([id, name]) => {
-                const account = accounts[id];
-                const roundScores = classScores[id]?.[roundKey] || {};
-                return (
-                  <tr key={id}>
-                    <td style={overviewCell}>{id}</td>
-                    <td style={{ ...overviewCell, fontWeight: 600, color: "var(--ink)" }}>{name}</td>
-                    <td style={overviewCell}>
-                      <span style={{
-                        fontSize: 11, fontWeight: 600, padding: "2px 7px", borderRadius: 999,
-                        background: account ? "#E1F5EE" : "#F1EFE8",
-                        color: account ? "var(--teal)" : "var(--ink-soft)",
-                      }}>
-                        {account ? "완료" : "미등록"}
-                      </span>
-                    </td>
-                    {round.subjects.map((s) => (
-                      <td key={s} style={overviewCell}>{typeof roundScores[s]?.actual === "number" ? roundScores[s].actual : "-"}</td>
-                    ))}
-                  </tr>
-                );
-              })}
-              <tr>
-                <td style={overviewCell} colSpan={3}><strong>반 평균</strong></td>
-                {avgBySubject.map((v, i) => (
-                  <td key={round.subjects[i]} style={{ ...overviewCell, fontWeight: 700 }}>{v == null ? "-" : v}</td>
-                ))}
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      ) : (
-        <StudentGradeDetail name={selectedName} scores={classScores[selectedId] || {}} />
-      )}
+            ))}
+          </tbody>
+        </table>
+      </div>
     </SectionCard>
-  );
-}
-
-function StudentGradeDetail({ name, scores }) {
-  return (
-    <div>
-      <p style={{ fontSize: 14, fontWeight: 700, color: "var(--ink)", margin: "0 0 12px" }}>{name}의 회차별 성적</p>
-      {EXAM_ROUNDS.map((r) => {
-        const roundScores = scores[r.key] || {};
-        const hasAny = r.subjects.some((s) => typeof roundScores[s]?.actual === "number");
-        return (
-          <div key={r.key} style={{ marginBottom: 18 }}>
-            <p style={{ fontSize: 13, fontWeight: 700, color: "var(--ink)", margin: "0 0 8px" }}>{r.label}</p>
-            {!hasAny ? (
-              <EmptyHint text="입력된 점수가 없어." />
-            ) : (
-              <ul style={{ margin: 0, padding: 0, listStyle: "none" }}>
-                {r.subjects.map((s) => {
-                  const entry = roundScores[s] || {};
-                  const diff = typeof entry.actual === "number" && typeof entry.target === "number" ? entry.actual - entry.target : null;
-                  return (
-                    <li key={s} style={ruledLine}>
-                      <span style={{ color: "var(--ink)" }}>{s}</span>
-                      <span style={{ fontSize: 13, color: "var(--ink-soft)" }}>
-                        {typeof entry.actual === "number" ? entry.actual : "-"}
-                        {typeof entry.target === "number" && ` / 목표 ${entry.target}`}
-                        {diff != null && (
-                          <span style={{ marginLeft: 8, fontWeight: 700, color: diff >= 0 ? "var(--teal)" : "var(--coral)" }}>
-                            {diff >= 0 ? `+${diff}` : diff}
-                          </span>
-                        )}
-                      </span>
-                    </li>
-                  );
-                })}
-              </ul>
-            )}
-          </div>
-        );
-      })}
-    </div>
   );
 }
 
