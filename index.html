@@ -1045,7 +1045,7 @@ function ExamPlanner() {
 
         <DdayHero exam={exam} dday={dday} onSave={saveExam} loaded={examLoaded} canEdit={profile.studentId === VIEWER_ID} />
 
-        <nav style={tabBarStyle}>
+        <nav style={{ ...tabBarStyle, borderBottom: "none" }}>
           {PLANNER_TABS.map(([key, label]) => (
             <button
               key={key}
@@ -3379,11 +3379,11 @@ const ghostBtnStyle = { height: 34, padding: "0 12px", borderRadius: 6, border: 
 
 const xBtnStyle = { border: "none", background: "transparent", color: "var(--ink-soft)", cursor: "pointer", fontSize: 12, padding: "2px 6px" };
 
-const tabBarStyle = { display: "flex", gap: 6, marginBottom: 16, borderBottom: "1px solid var(--grid)", paddingBottom: 0, overflowX: "auto" };
+const tabBarStyle = { display: "flex", gap: 6, marginBottom: 16, borderBottom: "none", paddingBottom: 0, overflowX: "auto" };
 
-const tabBtnStyle = { flex: "0 0 auto", padding: "10px 10px", background: "transparent", border: "none", borderBottom: "3px solid transparent", color: "var(--ink-soft)", fontSize: 13, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" };
+const tabBtnStyle = { flex: "0 0 auto", padding: "10px 10px", background: "transparent", border: "none", borderBottom: "3px solid transparent", color: "var(--ink-soft)", fontSize: 13, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap", boxShadow: "none" };
 
-const tabBtnActiveStyle = { color: "var(--ink)", borderBottomColor: "var(--marker)" };
+const tabBtnActiveStyle = { color: "var(--ink)", borderBottom: "3px solid var(--marker)", boxShadow: "none" };
 
 const ruledLine = { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 0", borderBottom: "1px dashed var(--grid)", fontSize: 14 };
 
